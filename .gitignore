@@ -8,3 +8,9 @@ __pycache__/
 # 评测/进化运行产物：每次跑都会重生成，不入库
 output/
 datasets/*.db
+
+# 数据集本体与抓取缓存不入库：几十 MB 的 diff，且可由 repos.yaml 完全复现。
+# 入库的是**采集器 + 仓库清单 + 筛选规则**（即"怎么得到它"），
+# 而不是产物——产物入库反而会让人误以为数据集是手工整理的。
+datasets/*.jsonl
+datasets/.diff-cache/

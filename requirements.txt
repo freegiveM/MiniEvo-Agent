@@ -1,3 +1,8 @@
+# PyYAML 只被 scripts/collect_reverted_fix_dataset.py 用到（读仓库清单）。
+# 之所以不改用 JSON：清单需要逐仓库写"为什么选它"的注释，JSON 不支持注释，
+# 而这些理由本身是数据集设计的一部分，不该丢。脚本内延迟 import，
+# 运行服务不需要这个依赖。
+PyYAML>=6,<7
 psycopg[binary]>=3.1,<4
 redis>=5,<7
 PyJWT[crypto]>=2.8,<3

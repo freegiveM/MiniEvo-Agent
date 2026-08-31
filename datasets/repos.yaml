@@ -1,0 +1,270 @@
+# EvoAgent 评测数据集仓库清单
+#
+# 用途：scripts/collect_reverted_fix_dataset.py 按本清单采集已合并 bugfix PR，
+# 反转 diff 构造待审 PR。设计理由见同目录 README.md。
+#
+# ── 关于本清单的诚实说明 ────────────────────────────────────────────────
+# 每条 expect_classes / difficulty_tendency 是**先验预期**，来自这些仓库的
+# 公开缺陷历史特征，不是已验证的事实。采集跑完后必须用实际产出复核，
+# 若某类不足则调整 target_prs 或补充仓库。清单不是结论，是采样计划。
+# ────────────────────────────────────────────────────────────────────────
+
+version: 1
+
+# 模型知识截止日期，用于 pre/post-cutoff 切分。
+#
+# 这个值**必须与实际评测的模型对齐**，写死一个日期是错的：换模型就得换切点。
+# 采集器接受 --cutoff 覆盖本字段。下面的默认值对应 DeepSeek-V3 系列的
+# 公开声明截止，属于保守估计（供应商很少给精确日期，取早不取晚更安全：
+# 取早了会把干净样本误判为可能被记忆，是保守方向的错误）。
+cutoff: "2024-07-01"
+
+# 采集配额。故意超采：筛选规则会淘汰大部分候选，target_prs 是"想要的成品数"，
+# 采集器会按需翻更多页。
+target_total: 100
+
+defaults:
+  # 每仓库最多翻多少页已合并 PR（每页 100 条）。防止在低产仓库上无限翻页。
+  max_pages: 12
+
+# ══════════════════════════════════════════════════════════════════════
+# Validation 仓库（约 70% PR）
+# ══════════════════════════════════════════════════════════════════════
+#
+# 仓库不相交切分是硬约束：同仓库 PR 共享代码风格、目录结构、惯用法和
+# 测试组织方式，切在 PR 级别会让 holdout 泄漏。
+
+repos:
+  # ── 异步 Web / 网络栈：并发与资源生命周期缺陷的主要来源 ──────────────
+  - name: aio-libs/aiohttp
+    split: validation
+    domain: web-async
+    why: >
+      asyncio HTTP 框架，历史上大量 connector/session 未关闭、超时缺失、
+      取消传播错误的修复。是 L4（并发/资源生命周期）样本最可靠的来源之一，
+      而 L4 样本恰恰是最难凑够的。
+    expect_classes: [resource-leak, concurrency, logic-boundary]
+    difficulty_tendency: [L2, L3, L4]
+    test_cost: medium
+    target_prs: 8
+
+  - name: tornadoweb/tornado
+    split: validation
+    domain: web-async
+    why: >
+      早于 asyncio 的异步框架，IOLoop / 回调生命周期相关修复多。
+      与 aiohttp 同域但实现范式不同，能避免"并发样本全是一种写法"。
+    expect_classes: [resource-leak, concurrency]
+    difficulty_tendency: [L3, L4]
+    test_cost: low
+    target_prs: 6
+
+  - name: encode/httpx
+    split: validation
+    domain: http-client
+    why: >
+      较新的 HTTP 客户端，post-cutoff PR 供给充足（污染对照需要近期 PR，
+      而老牌仓库近期活跃度低，这是选它的主要原因）。
+    expect_classes: [resource-leak, logic-boundary, path-traversal]
+    difficulty_tendency: [L2, L3]
+    test_cost: low
+    target_prs: 7
+
+  - name: urllib3/urllib3
+    split: validation
+    domain: http-base
+    why: >
+      重试/超时/证书校验逻辑密集，有真实 CVE 记录（可填 label_provenance=cve，
+      而 CWE 严格命中率只在 CVE 子集上统计，需要这类样本撑分母）。
+    expect_classes: [logic-boundary, resource-leak, crypto-weak]
+    difficulty_tendency: [L1, L2, L3]
+    test_cost: low
+    target_prs: 7
+
+  # ── 任务队列 / 分布式：状态机与竞态 ──────────────────────────────────
+  - name: celery/celery
+    split: validation
+    domain: task-queue
+    why: >
+      任务状态机 + 多 worker 共享状态，ack/重试/可见性超时相关修复是
+      天然的 L4 样本。与本项目自身的 task_queue 主题重叠，答辩时可对照讲。
+    expect_classes: [concurrency, resource-leak, logic-boundary]
+    difficulty_tendency: [L3, L4]
+    test_cost: medium
+    target_prs: 7
+
+  - name: dask/dask
+    split: validation
+    domain: data-distributed
+    why: >
+      分布式调度 + 数组/DataFrame 分块边界计算，off-by-one 与分块索引
+      错误多，是 logic-boundary 的稳定来源。
+    expect_classes: [logic-boundary, concurrency]
+    difficulty_tendency: [L2, L3]
+    test_cost: high
+    target_prs: 6
+
+  # ── 数据校验 / 序列化：边界与解析 ────────────────────────────────────
+  - name: pydantic/pydantic
+    split: validation
+    domain: data-validation
+    why: >
+      校验逻辑本身就是边界判断，且 v1→v2 期间修复密度高、近期 PR 多。
+      纯 Python 逻辑（v2 核心在 Rust，但 Python 侧仍有大量修复）。
+    expect_classes: [logic-boundary, injection]
+    difficulty_tendency: [L1, L2]
+    test_cost: low
+    target_prs: 6
+
+  # ── 运维工具：注入与凭据暴露 ────────────────────────────────────────
+  - name: ansible/ansible
+    split: validation
+    domain: ops
+    why: >
+      模块大量拼 shell 命令、处理凭据与临时文件，是 injection /
+      secret-exposure / path-traversal 三类的主要来源。这三类在纯库类仓库里
+      很少见，没有 ops 仓库就凑不齐。
+    expect_classes: [injection, secret-exposure, path-traversal]
+    difficulty_tendency: [L1, L2]
+    test_cost: high
+    target_prs: 7
+
+  # ── 加密 / 远程访问：弱算法与认证 ───────────────────────────────────
+  - name: paramiko/paramiko
+    split: validation
+    domain: crypto-ssh
+    why: >
+      SSH 实现，历史上有主机密钥校验、算法降级、认证顺序相关的真实 CVE。
+      crypto-weak 与 auth-bypass 两类的核心来源。
+    expect_classes: [crypto-weak, auth-bypass, resource-leak]
+    difficulty_tendency: [L2, L3]
+    test_cost: low
+    target_prs: 6
+
+  - name: mitmproxy/mitmproxy
+    split: validation
+    domain: security-tool
+    why: >
+      TLS 中间人代理，证书校验与协议状态机缺陷密集。安全工具域的代表，
+      避免"安全类缺陷全部来自 ops 仓库"的域偏斜。
+    expect_classes: [crypto-weak, concurrency, auth-bypass]
+    difficulty_tendency: [L3, L4]
+    test_cost: medium
+    target_prs: 6
+
+  - name: python-pillow/Pillow
+    split: validation
+    domain: media-parsing
+    why: >
+      图像解析，有大量真实 CVE（缓冲区与整数边界）。注意：核心解码在 C，
+      **只采 Python 侧修复**（筛选规则已强制"必须触碰非测试 .py"），
+      因此实际产出可能偏低，target 给保守值。
+    expect_classes: [logic-boundary, path-traversal, resource-leak]
+    difficulty_tendency: [L2, L3]
+    test_cost: medium
+    target_prs: 5
+
+  # ════════════════════════════════════════════════════════════════════
+  # Holdout 仓库（约 30% PR）
+  # ════════════════════════════════════════════════════════════════════
+  #
+  # Holdout 选择的一个非显然要求：**它必须能覆盖 validation 的缺陷类别谱**。
+  # 否则 Validation→Holdout 的下降会混入"分布不同"，而不是纯粹的
+  # "泛化到新仓库"。所以下面 5 个仓库刻意与 validation 的五个域一一对应，
+  # 而不是随手挑 5 个。
+  #
+  # 代价（诚实记录）：这让 holdout 不是"随机新仓库"，对泛化能力的估计
+  # 偏乐观——真实新仓库可能落在完全没见过的域上。报数时应说明这一点。
+
+  - name: django/django
+    split: holdout
+    domain: web-sync            # 对应 validation 的 web-async，范式不同
+    why: >
+      对应 web 域。ORM/中间件/权限装饰器相关修复多，auth-bypass 与
+      injection 供给好。规模大、风格极稳定，是"换仓库后是否还能定位"的
+      强测试。
+    expect_classes: [auth-bypass, injection, logic-boundary]
+    difficulty_tendency: [L2, L3]
+    test_cost: high
+    target_prs: 7
+
+  - name: apache/airflow
+    split: holdout
+    domain: ops                  # 对应 validation 的 ansible
+    why: >
+      对应 ops 域。调度器状态机 + 连接/变量凭据处理，同时供给
+      secret-exposure 与 concurrency。近期 PR 极多，post-cutoff 样本充足。
+    expect_classes: [secret-exposure, concurrency, auth-bypass]
+    difficulty_tendency: [L3, L4]
+    test_cost: high
+    target_prs: 7
+
+  - name: psf/requests
+    split: holdout
+    domain: http-base            # 对应 validation 的 urllib3
+    why: >
+      对应 HTTP 基础库域。有 CVE 记录（凭据跨重定向泄漏一类），
+      给 holdout 也留一点 CVE 子集样本，否则 CWE 严格命中只能在
+      validation 上算，holdout 无从对照。
+    expect_classes: [secret-exposure, logic-boundary, crypto-weak]
+    difficulty_tendency: [L1, L2]
+    test_cost: low
+    target_prs: 5
+
+  - name: PyCQA/bandit
+    split: holdout
+    domain: security-tool        # 对应 validation 的 mitmproxy
+    why: >
+      对应安全工具域。它本身是静态扫描器，其 bugfix 常是"规则漏报/误报"
+      的修正——与本项目的规则集主题同构，是很好的对照素材。
+      规模小、测试快，修复环节 before/after 对照成本低。
+    expect_classes: [logic-boundary, injection]
+    difficulty_tendency: [L1, L2]
+    test_cost: low
+    target_prs: 5
+
+  - name: pallets/jinja
+    split: holdout
+    domain: template-engine      # 对应 validation 的 pydantic（纯逻辑库）
+    why: >
+      对应纯 Python 逻辑库域。沙箱逃逸与自动转义相关修复是 injection /
+      auth-bypass 的少见来源；代码量小、测试秒级，适合做修复环节验证。
+    expect_classes: [injection, auth-bypass, logic-boundary]
+    difficulty_tendency: [L2, L3]
+    test_cost: low
+    target_prs: 5
+
+# ══════════════════════════════════════════════════════════════════════
+# 配额小结（采集前的账，跑完要用实际产出复核）
+# ══════════════════════════════════════════════════════════════════════
+#
+#   Validation  11 仓库  target 71 PR
+#   Holdout      5 仓库  target 29 PR
+#   合计        16 仓库  target 100 PR   （仓库比 11:5，PR 比约 71:29）
+#
+# 域覆盖：web-async 2 / web-sync 1 / http 3 / data 2 / ops 2 /
+#         crypto-ssh 1 / security-tool 2 / media 1 / template 1
+#
+# 八类缺陷的预期供给（按 expect_classes 出现次数，非最终产出）：
+#   logic-boundary 11 · resource-leak 7 · concurrency 6 · injection 5 ·
+#   auth-bypass 5 · crypto-weak 4 · secret-exposure 3 · path-traversal 3
+#
+# **已知薄弱项**（供给仓库数 < 每类至少 6 例的目标，采集前就能看出来，
+# 不该等跑完才发现）：
+#   secret-exposure 3 · path-traversal 3 · crypto-weak 4
+#
+# 不假装它没问题。三条可选对策，按代价从低到高：
+#   1. 采集后若确实不足，补 saltstack/salt（secret + injection 供给好）
+#      与 tarfile/zipfile 相关 CVE 修复（path-traversal）。代价：多跑一轮采集。
+#   2. 放宽 MAX_FIX_LINES。代价：引入标注噪声——修复越分散，"缺陷就在这几行"
+#      越站不住。**不采纳**，噪声污染的是核心指标。
+#   3. 接受不均，报数时按类给分母（如 crypto-weak 4/4），不报跨类平均值。
+#      代价：某些类的数字样本量太小、不能单独下结论。
+#
+# 默认走 1，不够则走 3。**任何情况下不走 2**：放宽规则的代价是全局的，
+# 类别不均的代价是局部的且可以如实标注。
+#
+# test_cost 分布：low 8 / medium 4 / high 4
+# 这一列是给 D7（修复环节评测）用的：before/after 对照要真跑测试，
+# high 成本仓库单轮可能几十分钟。D7 应优先用 low 成本仓库的子集，
+# 并明确说明"修复环节的数字来自哪个子集"，不能拿全集的分母去讲。
