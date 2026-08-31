@@ -6,7 +6,13 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from .agentic_core import ModeRouterReviewer
 from .evaluation_benchmark import ContextRuleReviewer
-from .evaluation_harness import EndToEndEvaluationHarness, dataset_fingerprint, one_to_one_match
+from .evaluation_harness import (
+    MATCH_TIERS,
+    EndToEndEvaluationHarness,
+    dataset_fingerprint,
+    one_to_one_match,
+    tiered_match,
+)
 from .llm import JsonChatClient
 
 
@@ -346,7 +352,18 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
         started = time.monotonic()
         result = super()._run_case(recording, case)
         result.update({
+            # 口径纪律：这个数是"落在标注之外的 finding 条数"，**不是误报数**。
+            # 数据集只标注了反转出来的那个种子缺陷，仓库里可能真有别的问题，
+            # reviewer 指出它们是对的。字段名保留 invalid_comments 是因为外部
+            # 报告已在读它（改名等于无声破坏），但语义以 unlabelled 为准，
+            # 且按最宽的 location 档计算——见下方 tiered_match 调用。
             "invalid_comments": result["fp"],
+            "unlabelled": result["fp"],
+            "tier_tp": {tier: 0 for tier in MATCH_TIERS},
+            "tier_fn": {tier: len([
+                item for item in case["expected_findings"]
+                if bool(item.get("should_comment", True))
+            ]) for tier in MATCH_TIERS},
             "exact_location_hits": 0,
             "evidence_hits": 0,
             "accepted_comments": int(case.get("accepted_comments", 0) or 0),
@@ -366,6 +383,19 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
                 item for item in case["expected_findings"]
                 if bool(item.get("should_comment", True))
             ]
+            # 三档命中同时累计。基类只算了默认的 cwe-exact 档，那一档会把
+            # 兄弟 CWE（CWE-78 vs CWE-95，同属 CWE-74）判成漏报——测的是
+            # "标注者和 reviewer 选了同一个兄弟"，不是"reviewer 是否发现了
+            # 缺陷"。三档分别回答：指对行了吗 / 认出类别了吗 / CWE 号一致吗。
+            tiers = tiered_match(expected, findings, self.line_tolerance)
+            for tier in MATCH_TIERS:
+                result["tier_tp"][tier] = tiers[tier]["tp"]
+                result["tier_fn"][tier] = tiers[tier]["fn"]
+            # 标注外条数按最宽的 location 档算：一个 finding 只要指对了行，
+            # 就不该被算成"标注外"，即使它把类别判错了。按严格档算会虚增
+            # 噪声量——那会让"归类错了"和"完全报错了"变成同一个数字。
+            result["unlabelled"] = tiers["unlabelled"]["count"]
+            result["invalid_comments"] = result["unlabelled"]
             matches = one_to_one_match(
                 expected, findings, self.line_tolerance
             )
@@ -402,6 +432,9 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
             "latency_ms": 0, "cost_microusd": 0,
             "llm_calls": 0, "input_tokens": 0,
             "output_tokens": 0, "total_tokens": 0,
+            "unlabelled": 0,
+            "tier_tp": {tier: 0 for tier in MATCH_TIERS},
+            "tier_fn": {tier: 0 for tier in MATCH_TIERS},
         })
         return values
 
@@ -412,9 +445,13 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
             "invalid_comments", "exact_location_hits", "evidence_hits",
             "accepted_comments", "closed_comments", "latency_ms",
             "llm_calls", "input_tokens", "output_tokens", "total_tokens",
+            "unlabelled",
         ):
             totals[field] += int(result.get(field, 0))
         totals["cost_microusd"] += int(float(result.get("cost_usd", 0)) * 1_000_000)
+        for tier in MATCH_TIERS:
+            totals["tier_tp"][tier] += int((result.get("tier_tp") or {}).get(tier, 0))
+            totals["tier_fn"][tier] += int((result.get("tier_fn") or {}).get(tier, 0))
 
     @staticmethod
     def _metrics(totals):
@@ -457,7 +494,27 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
             "failure_rate": (
                 round(1 - totals["execution_successes"] / cases, 4) if cases else None
             ),
+            # 每 PR 的标注外条数 = 噪声量。刻意与 invalid_comments_per_pr 同值
+            # 而换个名字：后者的字段名会被读成"误报率"，前者不会。真实误报率
+            # 要靠人工复核（D5 rubric + 抽样），自动层给不出。
+            "unlabelled_per_pr": per(totals["unlabelled"], cases),
         })
+        # 三档召回：location（指对行了吗）/ category（认出类别了吗）/
+        # cwe-exact（CWE 号一致吗）。分档报而不取一个数，因为"定位对了但归类
+        # 错了"和"完全没找到"对系统改进的指示完全不同——前者改 prompt 的分类
+        # 部分，后者改扫描覆盖。取一个数会把这两件事压成同一个数字。
+        tier_metrics = {}
+        for tier in MATCH_TIERS:
+            tier_tp = totals["tier_tp"][tier]
+            tier_fn = totals["tier_fn"][tier]
+            tier_metrics[tier] = {
+                "tp": tier_tp,
+                "fn": tier_fn,
+                # 分母是真值总数。为零时报 None 而非 1.0——没有正样本时
+                # "召回率"没有定义，报满分会让一个什么都不报的 reviewer 拿分。
+                "recall": per(tier_tp, tier_tp + tier_fn),
+            }
+        values["by_tier"] = tier_metrics
         return values
 
 
@@ -608,6 +665,14 @@ class FairAblationSuite:
                 "role_costs": _role_cost_totals(
                     arms[name]["case_results"], len(cases)
                 ),
+            }
+            # 消融表的核心对照：三档召回 + 噪声量。定位召回与严格召回分开报，
+            # 否则"指对行了但归类错了"会和"完全没找到"混成一个数字。
+            arms[name]["by_tier"] = {
+                "overall": arms[name]["metrics"]["by_tier"],
+                "validation": arms[name]["by_split"]["validation"]["by_tier"],
+                "holdout": arms[name]["by_split"]["holdout"]["by_tier"],
+                "unlabelled_per_pr": arms[name]["metrics"]["unlabelled_per_pr"],
                 "average_llm_calls_per_pr": arms[name]["metrics"]["average_llm_calls_per_pr"],
                 "average_total_tokens_per_pr": arms[name]["metrics"]["average_total_tokens_per_pr"],
                 "average_latency_ms_per_pr": arms[name]["metrics"]["average_latency_ms_per_pr"],
