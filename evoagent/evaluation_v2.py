@@ -77,6 +77,33 @@ def validate_real_dataset(cases: List[dict], minimum_cases: int = 300) -> Dict[s
     }
 
 
+def _delta_or_none(candidate, baseline):
+    """Difference of two metrics, or None when either side is undefined."""
+    if candidate is None or baseline is None:
+        return None
+    return round(float(candidate) - float(baseline), 4)
+
+
+def _not_worse(candidate, baseline) -> bool:
+    """True when candidate is no worse than baseline on a lower-is-better metric.
+
+    任一侧为 None 时返回 False：无法验证不退化，就不能当成没退化。
+    """
+    if candidate is None or baseline is None:
+        return False
+    return float(candidate) <= float(baseline)
+
+
+def _ci_lower_positive(entry: dict) -> bool:
+    """True only when the CI is present and its lower bound is above zero.
+
+    CI 缺失（分母为零导致无可用重采样）时返回 False——**不能**当成显著。
+    没有区间就没有显著性，这一点不该靠调用方记得去判空。
+    """
+    bounds = (entry or {}).get("ci95") or [None, None]
+    return bounds[0] is not None and bounds[0] > 0
+
+
 class _EvaluationTaskStore:
     """Minimal task input provider used by ModeRouterReviewer during replay."""
 
@@ -306,27 +333,44 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
 
     @staticmethod
     def _metrics(totals):
+        """Extend the base metrics, reporting None for undefined denominators.
+
+        ## 修掉的口径 bug
+
+        原实现 `tp = totals["tp"] or 1`（本文件旧第 311 行）。tp == 0 时分母被
+        悄悄换成 1，于是 exact_line_accuracy = 0/1 = 0.0 看起来像一个正常结论。
+        但 tp == 0 意味着**一个命中都没有**，"命中里有多少是精确到行的"这个
+        比率没有定义。报 0.0 会让人以为"命中了但都没到行"，那是另一回事。
+
+        `cases or 1` 同理：cases == 0 时 failure_rate = 1 - 0/1 = 1.0，
+        看起来像"全失败"，实际是"根本没跑"。
+
+        两处都改成分母为零时返回 None，报告渲染成 n/a。
+        """
         values = EndToEndEvaluationHarness._metrics(totals)
-        cases = totals["cases"] or 1
-        tp = totals["tp"] or 1
+        cases = totals["cases"]
+        tp = totals["tp"]
         commented = totals["accepted_comments"] + totals["closed_comments"]
+
+        def per(numerator, denominator, digits=4):
+            return round(numerator / denominator, digits) if denominator else None
+
         values.update({
-            "invalid_comments_per_pr": round(totals["invalid_comments"] / cases, 4),
-            "exact_line_accuracy": round(totals["exact_location_hits"] / tp, 4),
-            "evidence_accuracy": round(totals["evidence_hits"] / tp, 4),
-            "comment_acceptance_rate": round(
-                totals["accepted_comments"] / commented, 4
-            ) if commented else None,
-            "average_cost_usd_per_pr": round(
-                totals["cost_microusd"] / 1_000_000 / cases, 8
+            "invalid_comments_per_pr": per(totals["invalid_comments"], cases),
+            # 分母是 tp：没有命中就没有"命中的质量"可言。
+            "exact_line_accuracy": per(totals["exact_location_hits"], tp),
+            "evidence_accuracy": per(totals["evidence_hits"], tp),
+            "comment_acceptance_rate": per(totals["accepted_comments"], commented),
+            "average_cost_usd_per_pr": per(
+                totals["cost_microusd"] / 1_000_000, cases, 8
             ),
-            "average_latency_ms_per_pr": round(totals["latency_ms"] / cases, 2),
-            "average_llm_calls_per_pr": round(totals["llm_calls"] / cases, 4),
-            "average_input_tokens_per_pr": round(totals["input_tokens"] / cases, 2),
-            "average_output_tokens_per_pr": round(totals["output_tokens"] / cases, 2),
-            "average_total_tokens_per_pr": round(totals["total_tokens"] / cases, 2),
-            "failure_rate": round(
-                1 - totals["execution_successes"] / cases, 4
+            "average_latency_ms_per_pr": per(totals["latency_ms"], cases, 2),
+            "average_llm_calls_per_pr": per(totals["llm_calls"], cases),
+            "average_input_tokens_per_pr": per(totals["input_tokens"], cases, 2),
+            "average_output_tokens_per_pr": per(totals["output_tokens"], cases, 2),
+            "average_total_tokens_per_pr": per(totals["total_tokens"], cases, 2),
+            "failure_rate": (
+                round(1 - totals["execution_successes"] / cases, 4) if cases else None
             ),
         })
         return values
@@ -357,44 +401,96 @@ class FairAblationSuite:
             totals.update(case.get("model_roles") or {})
         return dict(sorted(totals.items()))
 
-    def _paired_delta(
-        self, left: dict, right: dict, metric: str, seed_offset: int,
+    def _paired_bootstrap(
+        self, left: dict, right: dict, metrics: tuple, seed_offset: int,
     ) -> dict:
+        """Paired bootstrap CI for several metrics over ONE shared resample index.
+
+        ## 改掉的问题：每个 metric 用了不同的重采样
+
+        原实现 `_comparison` 给每个 metric 传 `seed_offset + index`，即
+        f1 / precision / recall / high_risk_recall 各自在**不同的重采样**上
+        计算 CI。后果是这些 CI 无法联合解读——而 critic_gate 的
+        `critic_statistically_positive` 恰恰联合用了 f1 与 precision 两条 CI：
+
+            critic_comparison["f1"]["ci95"][0] > 0
+            or (critic_comparison["precision"]["ci95"][0] > 0 and ...)
+
+        两条 CI 来自不同重采样时，这个 or 没有统一的概率解释。
+
+        改为：一次重采样同时算全部 metric。这也是计划里"paired bootstrap，
+        共享重采样索引"的本意——四臂跑的是同一批 PR，配对比较必须在同一
+        重采样上做，否则比较的一部分方差来自"抽到了不同的 PR"而不是
+        "两臂表现不同"。
+
+        ## 空分母的处理
+
+        某次重采样可能抽出一批没有正样本的 PR，此时 metric 为 None
+        （见 _metrics 的口径修正）。这些迭代**跳过**而不是当 0 参与：
+        当 0 会把"这次抽样无法计算"混进"两臂差为 0"，人为把 CI 往 0 拉，
+        使显著性判定偏保守到失真。跳过的次数如实报出来
+        （`usable_iterations`），少于总数的一半就说明这个 metric 在
+        当前样本量下不该报 CI。
+        """
         left_cases = left["case_results"]
         right_cases = right["case_results"]
         if [item["id"] for item in left_cases] != [item["id"] for item in right_cases]:
             raise ValueError("paired comparison requires identical ordered case ids")
         count = len(left_cases)
+        empty = {
+            metric: {
+                "delta": None, "ci95": [None, None],
+                "iterations": 0, "usable_iterations": 0,
+            }
+            for metric in metrics
+        }
         if not count:
-            return {"delta": 0.0, "ci95": [0.0, 0.0], "iterations": 0}
+            return empty
+
         rng = random.Random(self.bootstrap_seed + seed_offset)
-        deltas = []
+        samples = {metric: [] for metric in metrics}
         for _ in range(self.bootstrap_iterations):
             left_totals = ProductionEvaluationHarness._empty_totals()
             right_totals = ProductionEvaluationHarness._empty_totals()
+            # 一个索引列表，两臂共用 —— 这是"配对"的全部含义。
             for _sample in range(count):
                 index = rng.randrange(count)
                 ProductionEvaluationHarness._accumulate(left_totals, left_cases[index])
                 ProductionEvaluationHarness._accumulate(right_totals, right_cases[index])
-            left_value = ProductionEvaluationHarness._metrics(left_totals)[metric]
-            right_value = ProductionEvaluationHarness._metrics(right_totals)[metric]
-            deltas.append(float(right_value) - float(left_value))
-        deltas.sort()
-        lower = deltas[int((len(deltas) - 1) * 0.025)]
-        upper = deltas[int((len(deltas) - 1) * 0.975)]
-        point = float(right["metrics"][metric]) - float(left["metrics"][metric])
-        return {
-            "delta": round(point, 4),
-            "ci95": [round(lower, 4), round(upper, 4)],
-            "iterations": self.bootstrap_iterations,
-        }
+            left_metrics = ProductionEvaluationHarness._metrics(left_totals)
+            right_metrics = ProductionEvaluationHarness._metrics(right_totals)
+            for metric in metrics:
+                left_value = left_metrics[metric]
+                right_value = right_metrics[metric]
+                if left_value is None or right_value is None:
+                    continue
+                samples[metric].append(float(right_value) - float(left_value))
+
+        result = {}
+        for metric in metrics:
+            deltas = sorted(samples[metric])
+            point = _delta_or_none(
+                right["metrics"][metric], left["metrics"][metric]
+            )
+            if not deltas:
+                result[metric] = {
+                    "delta": point, "ci95": [None, None],
+                    "iterations": self.bootstrap_iterations, "usable_iterations": 0,
+                }
+                continue
+            lower = deltas[int((len(deltas) - 1) * 0.025)]
+            upper = deltas[int((len(deltas) - 1) * 0.975)]
+            result[metric] = {
+                "delta": point,
+                "ci95": [round(lower, 4), round(upper, 4)],
+                "iterations": self.bootstrap_iterations,
+                "usable_iterations": len(deltas),
+            }
+        return result
 
     def _comparison(self, left: dict, right: dict, seed_offset: int) -> dict:
         metrics = ("f1", "precision", "recall", "high_risk_recall")
-        return {
-            metric: self._paired_delta(left, right, metric, seed_offset + index)
-            for index, metric in enumerate(metrics)
-        }
+        return self._paired_bootstrap(left, right, metrics, seed_offset)
 
     @staticmethod
     def _split_view(arm: dict, split: str) -> dict:
@@ -434,16 +530,18 @@ class FairAblationSuite:
         full_holdout = self._split_view(arms["full-agentic"], "holdout")
         baseline = single_holdout["metrics"]
         candidate = full_holdout["metrics"]
-        f1_gain = round(candidate["f1"] - baseline["f1"], 4)
-        high_gain = round(
-            candidate["high_risk_recall"] - baseline["high_risk_recall"], 4
+        # 所有比较都过 _delta_or_none / _not_worse：指标为 None（分母为零，
+        # 比率无定义）时门禁判不通过而不是崩溃，也不静默当 0 放行。
+        f1_gain = _delta_or_none(candidate["f1"], baseline["f1"])
+        high_gain = _delta_or_none(
+            candidate["high_risk_recall"], baseline["high_risk_recall"]
         )
-        false_positive_non_regression = (
-            candidate["invalid_comments_per_pr"]
-            <= baseline["invalid_comments_per_pr"]
+        false_positive_non_regression = _not_worse(
+            candidate["invalid_comments_per_pr"], baseline["invalid_comments_per_pr"]
         )
-        launch = (
-            (f1_gain >= 0.03 or high_gain >= 0.05)
+        launch = bool(
+            ((f1_gain is not None and f1_gain >= 0.03)
+             or (high_gain is not None and high_gain >= 0.05))
             and false_positive_non_regression
         )
         multi_comparison = self._comparison(
@@ -453,19 +551,21 @@ class FairAblationSuite:
             no_critic_holdout, full_holdout, 200,
         )
         multi_statistically_positive = (
-            multi_comparison["f1"]["ci95"][0] > 0
-            or multi_comparison["high_risk_recall"]["ci95"][0] > 0
+            _ci_lower_positive(multi_comparison["f1"])
+            or _ci_lower_positive(multi_comparison["high_risk_recall"])
         )
         no_critic = no_critic_holdout["metrics"]
-        critic_false_positive_non_regression = (
-            candidate["invalid_comments_per_pr"]
-            <= no_critic["invalid_comments_per_pr"]
+        critic_false_positive_non_regression = _not_worse(
+            candidate["invalid_comments_per_pr"], no_critic["invalid_comments_per_pr"]
         )
-        critic_recall_non_regression = candidate["recall"] >= no_critic["recall"] - 0.01
+        critic_recall_non_regression = (
+            candidate["recall"] is not None and no_critic["recall"] is not None
+            and candidate["recall"] >= no_critic["recall"] - 0.01
+        )
         critic_statistically_positive = (
-            critic_comparison["f1"]["ci95"][0] > 0
+            _ci_lower_positive(critic_comparison["f1"])
             or (
-                critic_comparison["precision"]["ci95"][0] > 0
+                _ci_lower_positive(critic_comparison["precision"])
                 and critic_recall_non_regression
             )
         )

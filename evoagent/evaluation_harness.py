@@ -555,14 +555,45 @@ class EndToEndEvaluationHarness:
 
     @staticmethod
     def _metrics(totals: Dict[str, int]) -> Dict[str, Any]:
-        def ratio(numerator: int, denominator: int, empty: float = 1.0) -> float:
+        """Compute metrics, reporting None (rendered as n/a) for empty denominators.
+
+        ## 修掉的口径 bug
+
+        原实现 `def ratio(numerator, denominator, empty=1.0)`——分母为零时默认
+        返回 **1.0**（满分）。后果：一个**什么都不报的 reviewer** 在没有正样本
+        的批次上同时拿到 recall=1.0、severity_accuracy=1.0、high_risk_recall=1.0、
+        clean_accuracy=1.0，f1 也被 recall 抬起来。空集合不是"全对",
+        是"这个比率没有定义"。
+
+        改为返回 `None`。`None` 与 0.0 的区别是实质的：
+        - 0.0 = "测过了，一个都没中" —— 是一个结论。
+        - None = "没有样本，无法下结论" —— 报告里必须显示 n/a。
+
+        把后者写成 0.0 会低估，写成 1.0 会高估，两者都是编造。
+
+        ## 为什么不是全部改成 0.0（更省事的做法）
+
+        0.0 会让门禁误判：`clean_accuracy_non_regression` 比较
+        candidate >= baseline，若两边都因无 clean 样本而变成 0.0，门禁会
+        "通过"——但它其实什么都没验证。None 会让门禁显式变成 not_applicable，
+        这个区别在答辩时是可讲的：**门禁没有静默放行**。
+        """
+        def ratio(
+            numerator: int, denominator: int, empty: Optional[float] = None,
+        ) -> Optional[float]:
             return round(numerator / denominator, 4) if denominator else empty
 
-        precision = ratio(totals["tp"], totals["tp"] + totals["fp"], 0.0)
-        recall = ratio(totals["tp"], totals["tp"] + totals["fn"], 1.0)
-        f1 = round(
-            2 * precision * recall / (precision + recall), 4
-        ) if precision + recall else 0.0
+        # precision / recall 的空集合语义仍是 None，但 f1 需要数值参与计算。
+        precision = ratio(totals["tp"], totals["tp"] + totals["fp"])
+        recall = ratio(totals["tp"], totals["tp"] + totals["fn"])
+        # f1 只在两者都有定义时有定义。缺一个就是 None，不用 0 填充——
+        # 用 0 填充会让"没有正样本"看起来像"全漏了"。
+        if precision is None or recall is None:
+            f1: Optional[float] = None
+        elif precision + recall:
+            f1 = round(2 * precision * recall / (precision + recall), 4)
+        else:
+            f1 = 0.0
         return {
             **totals,
             "precision": precision,
@@ -571,16 +602,38 @@ class EndToEndEvaluationHarness:
             "severity_accuracy": ratio(totals["severity_hits"], totals["tp"]),
             "high_risk_recall": ratio(totals["high_hits"], totals["high_total"]),
             "clean_accuracy": ratio(totals["clean_hits"], totals["clean_cases"]),
+            # execution_success_rate 的分母是 cases。cases == 0 意味着这一批
+            # 根本没跑，仍然是 None 而不是 0.0——"没跑"和"跑了全失败"不同。
             "execution_success_rate": ratio(
-                totals["execution_successes"], totals["cases"], 0.0
+                totals["execution_successes"], totals["cases"]
             ),
-            "safe_fix_rate": ratio(
-                totals["repair_passed"], totals["repair_attempted"], 0.0
-            ),
-            "e2e_security_fix_rate": ratio(
-                totals["e2e_successes"], totals["risk_cases"], 0.0
-            ),
+            "safe_fix_rate": ratio(totals["repair_passed"], totals["repair_attempted"]),
+            "e2e_security_fix_rate": ratio(totals["e2e_successes"], totals["risk_cases"]),
         }
+
+
+def _delta(candidate: Optional[float], baseline: Optional[float]) -> Optional[float]:
+    """Difference of two metrics, or None when either side is undefined."""
+    if candidate is None or baseline is None:
+        return None
+    return round(candidate - baseline, 4)
+
+
+def _at_least(
+    candidate: Optional[float], threshold: Optional[float], margin: float = 0.0,
+) -> Optional[bool]:
+    """Three-state gate comparison: True / False / None (not applicable).
+
+    任一侧为 None（分母为零，比率无定义）时返回 None，**而不是 False 或 True**。
+
+    为什么必须是三态：若无声当成 False，一个从来没有 clean 样本的数据集会让
+    clean_accuracy 门禁永远失败，逼人去关掉这个门禁；若当成 True，门禁就是
+    静默放行——报告上写着"门禁通过"，实际什么都没验证。返回 None 让报告
+    显式写出 not_applicable，读的人能看见"这条没验证"。
+    """
+    if candidate is None or threshold is None:
+        return None
+    return candidate >= threshold + margin
 
 
 def comparison_summary(
@@ -595,44 +648,47 @@ def comparison_summary(
     )
     quantitative_gates = {
         "validation_f1_improvement": {
-            "passed": (
-                candidate["by_split"]["validation"]["f1"]
-                >= baseline["by_split"]["validation"]["f1"] + minimum_f1_improvement
+            "passed": _at_least(
+                candidate["by_split"]["validation"]["f1"],
+                baseline["by_split"]["validation"]["f1"],
+                minimum_f1_improvement,
             ),
             "minimum_delta": minimum_f1_improvement,
         },
         "high_risk_recall_non_regression": {
-            "passed": (
-                candidate["metrics"]["high_risk_recall"]
-                >= baseline["metrics"]["high_risk_recall"]
+            "passed": _at_least(
+                candidate["metrics"]["high_risk_recall"],
+                baseline["metrics"]["high_risk_recall"],
             ),
         },
         "clean_accuracy_non_regression": {
-            "passed": (
-                candidate["metrics"]["clean_accuracy"]
-                >= baseline["metrics"]["clean_accuracy"]
+            "passed": _at_least(
+                candidate["metrics"]["clean_accuracy"],
+                baseline["metrics"]["clean_accuracy"],
             ),
         },
         "holdout_f1_non_regression": {
-            "passed": (
-                candidate["by_split"]["holdout"]["f1"]
-                >= baseline["by_split"]["holdout"]["f1"]
+            "passed": _at_least(
+                candidate["by_split"]["holdout"]["f1"],
+                baseline["by_split"]["holdout"]["f1"],
             ),
         },
         "execution_success": {
-            "passed": (
-                candidate["metrics"]["execution_success_rate"]
-                >= minimum_execution_success
+            "passed": _at_least(
+                candidate["metrics"]["execution_success_rate"],
+                minimum_execution_success,
             ),
             "minimum": minimum_execution_success,
         },
         "safe_fix_rate": {
-            "passed": candidate["metrics"]["safe_fix_rate"] >= minimum_safe_fix_rate,
+            "passed": _at_least(
+                candidate["metrics"]["safe_fix_rate"], minimum_safe_fix_rate
+            ),
             "minimum": minimum_safe_fix_rate,
         },
         "e2e_security_fix_rate": {
-            "passed": (
-                candidate["metrics"]["e2e_security_fix_rate"] >= minimum_e2e_fix_rate
+            "passed": _at_least(
+                candidate["metrics"]["e2e_security_fix_rate"], minimum_e2e_fix_rate
             ),
             "minimum": minimum_e2e_fix_rate,
         },
@@ -645,21 +701,28 @@ def comparison_summary(
     }
     gates = dict(quantitative_gates)
     gates["production_data_provenance"] = provenance_gate
+    # None（not_applicable）不算通过：无法验证的门禁不能放行。这比
+    # `all()` 把 None 当假值更明确——同时把 not_applicable 列出来，
+    # 让读报告的人看见"这条没验证"，而不是以为它失败了。
+    not_applicable = sorted(
+        name for name, item in gates.items() if item["passed"] is None
+    )
     quantitative_passed = all(
-        item["passed"] for item in quantitative_gates.values()
+        item["passed"] is True for item in quantitative_gates.values()
     )
     return {
         "dataset_sha256": candidate["dataset"]["sha256"],
         "baseline": baseline["name"],
         "candidate": candidate["name"],
         "deltas": {
-            metric: round(
-                candidate["metrics"][metric] - baseline["metrics"][metric], 4
+            metric: _delta(
+                candidate["metrics"][metric], baseline["metrics"][metric]
             )
             for metric in metrics
         },
+        "not_applicable_gates": not_applicable,
         "release_gate": {
-            "passed": all(item["passed"] for item in gates.values()),
+            "passed": all(item["passed"] is True for item in gates.values()),
             "quantitative_passed": quantitative_passed,
             "production_activation_allowed": (
                 quantitative_passed and provenance_gate["passed"]
