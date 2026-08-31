@@ -1,0 +1,63 @@
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(7, 8, 10, .88);
+  backdrop-filter: blur(14px);
+}
+
+.login-card {
+  width: min(430px, calc(100vw - 32px));
+  padding: 34px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-panel);
+  background: #14181e;
+  box-shadow: 0 30px 100px rgba(0, 0, 0, .52);
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 34px;
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.login-brand .brand-mark {
+  width: 38px;
+  height: 38px;
+  flex-basis: 38px;
+}
+
+.login-card h2 {
+  margin: 0 0 7px;
+  font-size: 28px;
+  letter-spacing: -1px;
+}
+
+.login-lead {
+  margin: 0 0 25px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.login-card .button {
+  width: 100%;
+  margin-top: 5px;
+}
+
+.login-error {
+  min-height: 18px;
+  margin: 13px 0 0;
+  color: #ffabab;
+  font-size: 11px;
+}
+
+@media (max-width: 480px) {
+  .login-card { padding: 27px 23px; }
+}

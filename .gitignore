@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.db
+.env
+.pytest_cache/
+
+
+# 评测/进化运行产物：每次跑都会重生成，不入库
+output/
+datasets/*.db

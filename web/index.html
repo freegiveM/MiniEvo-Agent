@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d10">
+  <title>EvoAgent · 智能代码审查控制台</title>
+  <meta name="description" content="EvoAgent 多智能体代码审查、自动修复与 Skill 演进控制台">
+  <link rel="stylesheet" href="/assets/app.css?v=20260805.5">
+  <link rel="stylesheet" href="/assets/login.css?v=20260805">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#overview" aria-label="EvoAgent 首页">
+        <span class="brand-mark" aria-hidden="true">E</span>
+        <span class="brand-copy">EvoAgent<small>REVIEW CONTROL</small></span>
+      </a>
+
+      <nav class="nav-list">
+        <button class="nav-item active" data-view="overview" data-icon="OV">
+          <span>运行总览</span>
+        </button>
+        <button class="nav-item" data-view="review" data-icon="RV">
+          <span>发起审查</span>
+        </button>
+        <button class="nav-item" data-view="tasks" data-icon="TS">
+          <span>任务中心</span>
+        </button>
+        <button class="nav-item" data-view="skills" data-icon="SK">
+          <span>Skills</span>
+        </button>
+        <button class="nav-item" data-view="evolution" data-icon="EV">
+          <span>演进实验室</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span><small>系统状态</small><b id="system-status">正在连接服务</b></span>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <h1 id="page-title">运行总览</h1>
+        <div class="top-actions">
+          <button class="refresh-button" id="refresh" aria-label="刷新当前数据">刷新</button>
+          <button class="button secondary hidden" id="logout">退出登录</button>
+          <span class="avatar" aria-label="当前用户">EA</span>
+        </div>
+      </header>
+
+      <section class="view active" id="view-overview" aria-labelledby="page-title">
+        <div class="hero">
+          <div class="hero-copy">
+            <h2>让每一次代码审查，<br><em>都成为系统的经验。</em></h2>
+            <p>安全、可靠性与 AI Agent 并行协作。Harness 统一管理状态、预算、回放与版本门禁。</p>
+            <div class="hero-actions">
+              <button class="button accent" data-jump="review">新建 PR 审查</button>
+              <button class="text-button" data-jump="tasks">查看任务记录</button>
+            </div>
+          </div>
+          <div class="hero-visual" aria-hidden="true">
+            <div class="orbit orbit-one"></div>
+            <div class="orbit orbit-two"></div>
+            <div class="core"><span>E</span><small>HARNESS</small></div>
+            <span class="node node-a">SEC</span>
+            <span class="node node-b">REL</span>
+            <span class="node node-c">LLM</span>
+          </div>
+        </div>
+
+        <div class="stats" id="stats" aria-live="polite">
+          <div class="stat loading"></div><div class="stat loading"></div><div class="stat loading"></div>
+          <div class="stat loading"></div><div class="stat loading"></div><div class="stat loading"></div>
+        </div>
+
+        <div class="dashboard-grid">
+          <article class="panel tasks-panel">
+            <div class="panel-head">
+              <h3>最近任务</h3>
+              <button class="link-button" data-jump="tasks">查看全部</button>
+            </div>
+            <div id="recent-tasks" class="task-list">
+              <div class="list-loading"></div><div class="list-loading"></div><div class="list-loading"></div>
+            </div>
+          </article>
+
+          <article class="panel agent-panel">
+            <div class="panel-head">
+              <h3>实际执行链</h3>
+              <span class="status status-online"><i></i>运行中</span>
+            </div>
+            <div class="agent-flow" id="execution-chain">
+              <div class="agent-step is-pending" id="llm-agent-step">
+                <b>--</b><span><strong>读取运行模式</strong><small id="llm-agent-detail">正在读取实际模型配置</small></span>
+                <em id="llm-agent-state">检查中</em>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-review" aria-labelledby="page-title">
+        <div class="section-heading">
+          <div><h2>提交 Pull Request Diff</h2><p>选择规则、单模型或真实多模型模式，报告会披露实际调用成本。</p></div>
+        </div>
+        <div class="form-layout">
+          <article class="panel form-panel">
+            <form id="review-form">
+              <div class="field-row">
+                <label>仓库地址
+                  <input name="repository" placeholder="owner/repository" autocomplete="off" required>
+                </label>
+                <label>PR 编号 <span class="optional">可选</span>
+                  <input name="pull_request" type="number" min="1" placeholder="例如 42">
+                </label>
+              </div>
+              <label>运行模式
+                <select name="mode" id="review-mode">
+                  <option value="rules-only">rules-only · 纯规则扫描</option>
+                  <option value="hybrid">hybrid · 规则 + 单 LLM</option>
+                  <option value="agentic">agentic · 四个真实 LLM 角色</option>
+                </select>
+              </label>
+              <label class="diff-field"><span class="field-label">Unified Diff <span class="field-meta" id="diff-stats" aria-live="polite">0 行，0 字符</span></span>
+                <textarea name="diff" rows="15" spellcheck="false" required placeholder="--- a/app.py&#10;+++ b/app.py&#10;@@ -1 +1 @@&#10;-old_value&#10;+new_value"></textarea>
+              </label>
+              <div class="form-footer">
+                <label class="check"><input name="async" type="checkbox" checked><span>放入异步队列</span></label>
+                <button class="button" type="submit">开始代码审查</button>
+              </div>
+            </form>
+          </article>
+          <aside class="panel strategy-panel">
+            <h3>执行策略</h3>
+            <ol>
+              <li><b>01</b><span><strong>解析变更</strong><small>只定位新增代码与新文件行号</small></span></li>
+              <li><b>02</b><span><strong>按模式执行</strong><small>Scanner 或 LLM Agent 依据实际配置运行</small></span></li>
+              <li><b>03</b><span><strong>质量门禁</strong><small>过滤无定位、无修复方案的结论</small></span></li>
+              <li><b>04</b><span><strong>经验沉淀</strong><small>反馈自动进入失败案例库</small></span></li>
+            </ol>
+            <div id="review-result" class="result empty" aria-live="polite">审查结果将在这里显示</div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-tasks" aria-labelledby="page-title">
+        <div class="section-heading">
+          <div><h2>审查任务</h2><p>跟踪任务状态，查看报告并创建安全修复分支。</p></div>
+        </div>
+        <div class="tasks-layout">
+          <article class="panel">
+            <div class="panel-head">
+              <h3>全部任务</h3><span class="muted">选择任务查看详情</span>
+            </div>
+            <div id="all-tasks" class="task-list"><div class="list-loading"></div></div>
+          </article>
+          <article class="panel report-panel">
+            <div class="panel-head">
+              <h3>任务报告</h3>
+              <button class="button danger hidden" id="create-fix">创建修复分支</button>
+            </div>
+            <pre id="task-report">请选择一个已完成的任务。</pre>
+            <section class="feedback-panel hidden" id="feedback-panel" aria-labelledby="feedback-title">
+              <div class="feedback-head">
+                <div>
+                  <h3 id="feedback-title">审查反馈</h3>
+                  <p>标记误报、漏报或坏修复；反馈会进入演进实验室的候选评测队列。</p>
+                </div>
+                <span class="feedback-scope">仅本任务</span>
+              </div>
+              <form id="feedback-form">
+                <div class="field-row feedback-fields">
+                  <label>反馈类型
+                    <select name="category" id="feedback-category">
+                      <option value="false_positive">误报</option>
+                      <option value="missed_issue">漏报</option>
+                      <option value="bad_fix">坏修复</option>
+                    </select>
+                  </label>
+                  <label>关联审查结论 <span class="optional">可选</span>
+                    <select name="finding_index" id="feedback-finding">
+                      <option value="">不关联已有结论</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="feedback-missed-fields hidden" id="feedback-missed-fields">
+                  <p>漏报可补充规则和位置，帮助后续候选更准确地学习。</p>
+                  <div class="field-row feedback-location-fields">
+                    <label>规则 ID <span class="optional">可选</span><input name="rule_id" placeholder="例如 SEC-INPUT-VALIDATION"></label>
+                    <label>文件路径 <span class="optional">可选</span><input name="path" placeholder="例如 app/api.py"></label>
+                    <label>行号 <span class="optional">可选</span><input name="line" type="number" min="1" placeholder="42"></label>
+                  </div>
+                </div>
+                <label>说明
+                  <textarea name="note" rows="4" maxlength="2000" required placeholder="说明判断依据、预期行为或修复造成的问题。"></textarea>
+                </label>
+                <div class="form-footer feedback-footer">
+                  <span class="form-hint" id="feedback-hint">提交后可在本任务和演进实验室查看状态。</span>
+                  <button class="button" type="submit">提交反馈</button>
+                </div>
+              </form>
+              <div id="feedback-result" class="feedback-result" aria-live="polite"></div>
+              <div id="task-feedback-history" class="feedback-history" aria-live="polite"></div>
+            </section>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-skills" aria-labelledby="page-title">
+        <div class="section-heading inline">
+          <div><h2>组件与 Skill 能力</h2><p>区分 LLM Agent、Tool/Scanner 与 Gate，并查看真实模型运行时。</p></div>
+          <button class="button secondary" id="reload-skills">重新扫描 Skills</button>
+        </div>
+        <article class="llm-capability" id="llm-capability" aria-live="polite">
+          <div class="llm-capability-main">
+            <span class="capability-glyph" aria-hidden="true">LLM</span>
+            <div><h3>LLM Review Agent</h3><p id="llm-capability-detail">正在读取模型运行时</p></div>
+          </div>
+          <div class="capability-runtime">
+            <span class="runtime-status is-pending" id="llm-runtime-status">检查中</span>
+            <strong id="llm-runtime-model">Provider 未知</strong>
+          </div>
+        </article>
+        <div class="section-subhead">
+          <h3>动态 Skills</h3>
+          <span>由注册表加载，可独立版本化</span>
+        </div>
+        <div class="cards" id="skill-list"><div class="skill-card loading"></div><div class="skill-card loading"></div></div>
+      </section>
+
+      <section class="view" id="view-evolution" aria-labelledby="page-title">
+        <div class="section-heading inline">
+          <div><h2>演进实验室</h2><p>将已提交的审查反馈转换为候选提示词，再用独立回放评测决定能否激活。</p></div>
+          <button class="button secondary" id="auto-evolve">从反馈生成候选</button>
+        </div>
+        <article class="evolution-purpose" aria-label="演进实验室的工作方式">
+          <span><b>01</b>收集任务反馈</span><i aria-hidden="true"></i><span><b>02</b>生成候选提示词</span><i aria-hidden="true"></i><span><b>03</b>回放门禁后激活</span>
+          <p>它不会直接修改线上规则；只有候选在 Validation 提升且 Holdout 不退化时，才会替换当前提示词版本。</p>
+        </article>
+        <article class="panel status-panel">
+          <div class="panel-head"><h3>评测就绪状态</h3><span class="status status-neutral">实时状态</span></div>
+          <pre id="evolution-status">正在读取模型与评测集状态…</pre>
+        </article>
+        <div class="evolution-grid">
+          <article class="panel form-panel">
+            <h3>提交候选提示词</h3>
+            <form id="evolution-form">
+              <label>Skill 名称<input name="skill_name" value="llm-review" required></label>
+              <label>候选提示词<textarea name="prompt" rows="11" required>Review the unified diff. Return JSON findings with severity, fix and test. Report only actionable defects introduced by added lines.</textarea></label>
+              <button class="button" type="submit">运行新旧版本回放评测</button>
+            </form>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>失败案例与评测记录</h3></div>
+            <div id="failure-list"></div>
+            <div id="evolution-result" class="result empty" aria-live="polite">演进结果将在这里显示</div>
+          </article>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <div class="login-overlay hidden" id="login-overlay">
+    <form class="login-card" id="login-form">
+      <div class="login-brand">
+        <span class="brand-mark">E</span>
+        <span>EvoAgent<small>SECURE CONTROL PLANE</small></span>
+      </div>
+      <h2>登录控制台</h2>
+      <p class="login-lead">使用你的工作区凭据继续。</p>
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <label>租户 ID <span class="optional">可选</span><input name="tenant_id" placeholder="只有一个租户时可留空"></label>
+      <button class="button" type="submit">安全登录</button>
+      <p class="login-error" id="login-error" role="alert"></p>
+    </form>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js?v=20260805.6"></script>
+</body>
+</html>
