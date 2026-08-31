@@ -104,6 +104,78 @@ def _ci_lower_positive(entry: dict) -> bool:
     return bounds[0] is not None and bounds[0] > 0
 
 
+def _role_costs(model_call_log: List[dict]) -> Dict[str, Dict[str, int]]:
+    """Aggregate real per-role token and latency cost from the ledger.
+
+    ## 为什么要按角色拆，而不是只报每 PR 总量
+
+    "多角色更贵"是消融必须量化的代价——臂 C/D 相对臂 B 的 f1 提升，要放在
+    成本增量旁边才有意义。但原实现只用 Counter 数了每个角色**调用了几次**：
+
+        result["model_roles"] = dict(Counter(str(item.get("role")) for item in ...))
+
+    而 model_call_log 每条都带 input_tokens / output_tokens / duration_ms。
+    调用次数不能代替成本：planner 输出一个 task_graph 与 critic 逐条评审
+    全部候选，调用次数都是 1，token 量差一个量级。只报次数会让"哪个角色贵"
+    这个问题无法回答，也就无法讨论"砍掉哪个角色最划算"。
+
+    ## 两个刻意的选择
+
+    - **失败调用照样计入 token 与延迟。** 失败的调用同样烧钱、同样占用墙上
+      时间；把它排除会低估真实成本。`failed` 单独计数，这样"贵"与"白花"
+      能分开看。
+    - **duration_ms 逐调用相加，不等于 PR 墙上时间。** 角色之间可能并行，
+      相加会高于实际耗时。所以这里叫 duration_ms 而非 latency_ms：它衡量
+      "占用了多少模型时间"（成本口径），PR 端到端延迟另有
+      execution.duration_ms（体验口径）。两者混用会得出矛盾的结论。
+    """
+    totals: Dict[str, Dict[str, int]] = {}
+    for item in model_call_log:
+        role = str(item.get("role"))
+        bucket = totals.setdefault(role, {
+            "calls": 0, "failed": 0, "input_tokens": 0,
+            "output_tokens": 0, "total_tokens": 0, "duration_ms": 0,
+        })
+        bucket["calls"] += 1
+        bucket["failed"] += int(not bool(item.get("ok", True)))
+        input_tokens = int(item.get("input_tokens", 0) or 0)
+        output_tokens = int(item.get("output_tokens", 0) or 0)
+        bucket["input_tokens"] += input_tokens
+        bucket["output_tokens"] += output_tokens
+        bucket["total_tokens"] += input_tokens + output_tokens
+        bucket["duration_ms"] += int(item.get("duration_ms", 0) or 0)
+    return dict(sorted(totals.items()))
+
+
+def _role_cost_totals(case_results: List[dict], cases: int) -> Dict[str, dict]:
+    """Sum per-role costs across cases and report per-PR averages.
+
+    分母用**这一臂跑过的 PR 总数**，不是"该角色被调用过的 PR 数"。理由：
+    "critic 平均每个 PR 花多少 token"里，没有触发 critic 的 PR 花的是 0，
+    那也是真实成本的一部分。按"被调用过的 PR"做分母会系统性高估单角色成本，
+    并且让不同角色的分母不一样、无法横向相加对照。
+
+    cases 为 0 时返回空字典而不是造零——与 _metrics 的空分母口径一致。
+    """
+    if not cases:
+        return {}
+    totals: Dict[str, Dict[str, int]] = {}
+    for case in case_results:
+        for role, values in (case.get("role_costs") or {}).items():
+            bucket = totals.setdefault(role, {
+                "calls": 0, "failed": 0, "input_tokens": 0,
+                "output_tokens": 0, "total_tokens": 0, "duration_ms": 0,
+            })
+            for key, value in values.items():
+                bucket[key] = bucket.get(key, 0) + int(value)
+    report = {}
+    for role, values in sorted(totals.items()):
+        report[role] = dict(values)
+        report[role]["tokens_per_pr"] = round(values["total_tokens"] / cases, 2)
+        report[role]["duration_ms_per_pr"] = round(values["duration_ms"] / cases, 2)
+    return report
+
+
 class _EvaluationTaskStore:
     """Minimal task input provider used by ModeRouterReviewer during replay."""
 
@@ -120,6 +192,7 @@ class ProductArmReviewer:
     def __init__(
         self, arm: str, client: JsonChatClient, total_token_budget: int,
         total_time_budget_seconds: int = 120,
+        critic_position_check: bool = False,
     ):
         if arm not in ARM_TOPOLOGY:
             raise ValueError("unknown evaluation arm: %s" % arm)
@@ -158,6 +231,7 @@ class ProductArmReviewer:
             default_time_budget=per_role_seconds,
             enabled_roles=enabled,
             scanners=[ContextRuleReviewer()],
+            critic_position_check=bool(critic_position_check),
         )
         self._sequence = 0
         self._last_summary: Dict[str, Any] = {}
@@ -220,8 +294,14 @@ class ProductArmReviewer:
 
 def product_reviewer_factories(
     client: JsonChatClient, total_time_budget_seconds: int = 120,
+    critic_position_check: bool = False,
 ) -> Dict[str, Callable[[str, int], ProductArmReviewer]]:
-    """Create all four arms with one model client and a shared total budget."""
+    """Create all four arms with one model client and a shared total budget.
+
+    `critic_position_check` 默认关：打开会让 critic 的调用与 token 翻倍。
+    想报 critic 的位置稳定性时显式打开，并且要意识到此时臂 D 的成本数字
+    包含了复核那一次——报成本和报稳定性不能用同一次运行的数字。
+    """
 
     def build(arm: str, model: str, token_budget: int) -> ProductArmReviewer:
         if str(client.model) != str(model):
@@ -231,6 +311,7 @@ def product_reviewer_factories(
             )
         return ProductArmReviewer(
             arm, client, token_budget, total_time_budget_seconds,
+            critic_position_check=critic_position_check,
         )
 
     return {
@@ -277,6 +358,7 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
             "output_tokens": 0,
             "total_tokens": 0,
             "model_roles": {},
+            "role_costs": {},
         })
         if result["execution_success"]:
             findings = recording.findings
@@ -306,6 +388,9 @@ class ProductionEvaluationHarness(EndToEndEvaluationHarness):
                     str(item.get("role"))
                     for item in execution.get("model_call_log") or []
                 ))
+                result["role_costs"] = _role_costs(
+                    execution.get("model_call_log") or []
+                )
         return result
 
     @staticmethod
@@ -518,6 +603,11 @@ class FairAblationSuite:
             }
             arms[name]["execution"] = {
                 "model_role_calls": self._role_totals(arms[name]["case_results"]),
+                # 真实 per-role 成本（从 ledger 的 model_call_log 聚合），
+                # 让"多角色贵多少"可以和 f1 提升并排看。
+                "role_costs": _role_cost_totals(
+                    arms[name]["case_results"], len(cases)
+                ),
                 "average_llm_calls_per_pr": arms[name]["metrics"]["average_llm_calls_per_pr"],
                 "average_total_tokens_per_pr": arms[name]["metrics"]["average_total_tokens_per_pr"],
                 "average_latency_ms_per_pr": arms[name]["metrics"]["average_latency_ms_per_pr"],

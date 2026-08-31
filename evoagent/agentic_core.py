@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import random
 import textwrap
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set
@@ -234,6 +235,7 @@ class ModeRouterReviewer(Reviewer):
         review_test_command: str = "",
         prompt_overlay: str = "",
         structured_config: Optional[Dict[str, Any]] = None,
+        critic_position_check: bool = False,
     ):
         self.store = store
         self.client = llm_client
@@ -255,6 +257,11 @@ class ModeRouterReviewer(Reviewer):
                 self.structured_config, ensure_ascii=False, sort_keys=True
             )
         self.gate = FindingGate()
+        # 默认关闭：反序复核让 critic 的调用次数与 token 成本翻倍。这是评测
+        # 阶段的诊断手段（想知道 critic 稳不稳），不是线上该常开的东西。
+        # 生产默认关 = 不为一个诊断指标付双倍成本；评测显式打开 = 报数时
+        # 能说清 critic 的稳定性。
+        self.critic_position_check = bool(critic_position_check)
         self._summaries: Dict[str, dict] = {}
 
     def _token_budget(self, role: str) -> int:
@@ -462,18 +469,10 @@ class ModeRouterReviewer(Reviewer):
         candidates = self._merge(rule_findings + findings)
         pre_critic_candidates = len(candidates)
         critic_decisions = []
+        position_consistency: Dict[str, Any] = {}
         if "critic" in enabled and candidates:
-            blinded = [
-                {
-                    "finding_index": index, "rule_id": item.rule_id,
-                    "severity": item.severity.value, "title": item.title,
-                    "explanation": item.explanation, "path": item.path, "line": item.line,
-                    "evidence": item.evidence, "evidence_refs": item.evidence_refs,
-                    "call_chain": item.call_chain, "fix": item.fix, "test": item.test,
-                    "confidence": item.confidence,
-                }
-                for index, item in enumerate(candidates)
-            ]
+            # 呈现顺序打乱，判定结果映射回规范顺序。见 _presentation_order。
+            order = self._presentation_order(len(candidates), diff)
             critic = BoundedRole(
                 "critic", CRITIC_PROMPT + (
                     ("\nActive validated prompt overlay:\n" + self.prompt_overlay)
@@ -481,16 +480,22 @@ class ModeRouterReviewer(Reviewer):
                 ), self.client,
                 self._token_budget("critic"), self.default_time_budget,
             )
-            result = critic.run(
-                json.dumps({"diff": diff, "candidates": blinded}, ensure_ascii=False),
-                suite.registry("critic", ROLE_PERMISSIONS["critic"]), ledger,
+            result = self._run_critic(
+                critic, candidates, order, diff, suite, ledger,
             )
             critic_evidence = _collect_evidence(result.get("_observations") or [])
-            by_index = {
-                int(item.get("finding_index")): item
-                for item in result.get("decisions") or []
-                if isinstance(item, dict) and str(item.get("finding_index", "")).isdigit()
-            }
+            by_index = self._decisions_by_canonical_index(result, order)
+            if self.critic_position_check:
+                # 反序复核：同一批候选、同一个 critic，只改呈现顺序。
+                reversed_order = list(reversed(order))
+                recheck = self._run_critic(
+                    critic, candidates, reversed_order, diff, suite, ledger,
+                )
+                position_consistency = self._position_consistency(
+                    by_index,
+                    self._decisions_by_canonical_index(recheck, reversed_order),
+                    len(candidates),
+                )
             accepted = []
             for index, finding in enumerate(candidates):
                 decision = by_index.get(index)
@@ -524,6 +529,7 @@ class ModeRouterReviewer(Reviewer):
             "candidate_findings_before_critic": pre_critic_candidates,
             "accepted_findings": len(candidates),
             "critic_decisions": critic_decisions,
+            "position_consistency": position_consistency,
         }
         components = scanner_components + [
             component(
@@ -535,6 +541,121 @@ class ModeRouterReviewer(Reviewer):
             for name in roles
         ]
         return candidates, collaboration, components
+
+    @staticmethod
+    def _presentation_order(count: int, diff: str) -> List[int]:
+        """Shuffle the order candidates are shown to the critic.
+
+        ## 为什么要打乱
+
+        `_merge` 按 (severity, path, line) 排序，于是 critic 每次都先看到
+        critical、后看到 low。LLM 评审存在已知的位置偏置（序列前部与末尾的
+        条目更容易被接受），固定顺序会让这个偏置与 severity **系统性共线**：
+        看起来像"critic 更信任高危结论"，实际可能只是"critic 更信任第一条"。
+        这两件事在报数上无法区分，而结论完全不同。
+
+        打乱之后偏置仍然存在，但变成随机噪声而不是系统偏差——它会加宽 CI，
+        不会伪造一个方向性结论。
+
+        ## 为什么用 diff 派生的种子，而不是全局随机
+
+        评测必须可复算：同一个 PR 重跑两次要得到同一个顺序，否则结果无法
+        复现，别人也没法核对。用 diff 内容的哈希做种子，做到
+        "跨 PR 之间独立、同一 PR 之内确定"。
+
+        三个选项：
+
+        | 选项 | 问题 |
+        |---|---|
+        | 1. 不打乱（原实现） | 位置偏置与 severity 共线，结论不可信 |
+        | 2. 全局 random | 不可复现，同一份数据两次跑出不同数字 |
+        | 3. diff 派生种子（采纳） | 需要一个稳定哈希，代价很小 |
+        """
+        order = list(range(count))
+        seed = int(hashlib.sha256(diff.encode("utf-8")).hexdigest()[:16], 16)
+        random.Random(seed).shuffle(order)
+        return order
+
+    def _run_critic(
+        self, critic: "BoundedRole", candidates: List[Finding],
+        order: List[int], diff: str, suite, ledger: ExecutionLedger,
+    ) -> Dict[str, Any]:
+        """Present candidates in `order` and return the critic's raw result.
+
+        `finding_index` 报的是**呈现位置**，不是规范下标——否则打乱就白做了：
+        critic 能从下标反推出原始 severity 排序。映射回规范下标由
+        `_decisions_by_canonical_index` 负责。
+        """
+        blinded = [
+            {
+                "finding_index": position,
+                "rule_id": candidates[index].rule_id,
+                "severity": candidates[index].severity.value,
+                "title": candidates[index].title,
+                "explanation": candidates[index].explanation,
+                "path": candidates[index].path, "line": candidates[index].line,
+                "evidence": candidates[index].evidence,
+                "evidence_refs": candidates[index].evidence_refs,
+                "call_chain": candidates[index].call_chain,
+                "fix": candidates[index].fix, "test": candidates[index].test,
+                "confidence": candidates[index].confidence,
+            }
+            for position, index in enumerate(order)
+        ]
+        return critic.run(
+            json.dumps({"diff": diff, "candidates": blinded}, ensure_ascii=False),
+            suite.registry("critic", ROLE_PERMISSIONS["critic"]), ledger,
+        )
+
+    @staticmethod
+    def _decisions_by_canonical_index(
+        result: Dict[str, Any], order: List[int],
+    ) -> Dict[int, dict]:
+        """Map decisions keyed by presentation position back to canonical indices."""
+        by_index = {}
+        for item in result.get("decisions") or []:
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("finding_index", ""))
+            if not raw.isdigit():
+                continue
+            position = int(raw)
+            if 0 <= position < len(order):
+                by_index[order[position]] = item
+        return by_index
+
+    @staticmethod
+    def _position_consistency(
+        first: Dict[int, dict], second: Dict[int, dict], count: int,
+    ) -> Dict[str, Any]:
+        """Compare two critic passes that differ only in presentation order.
+
+        报的是 critic 自身判定的稳定性，**不是** critic 判得对不对。两者是
+        不同的问题：一个不稳定的 critic 即使平均判得对，单次结论也不可信，
+        而单次结论正是线上会用的东西。
+
+        `agreement` 为 None 而不是 1.0 当没有候选——空集合上没有一致性可言
+        （与 _metrics 的空分母口径一致）。低一致性不会阻断流程，只如实报出：
+        它是一个需要在报告里说明的事实，不是运行时错误。
+        """
+        if not count:
+            return {"candidates": 0, "agreement": None, "flipped": []}
+        flipped = []
+        for index in range(count):
+            left = bool((first.get(index) or {}).get("accepted"))
+            right = bool((second.get(index) or {}).get("accepted"))
+            if left != right:
+                flipped.append(index)
+        return {
+            "candidates": count,
+            "agreement": round((count - len(flipped)) / count, 4),
+            "flipped": flipped,
+            "note": (
+                "Two critic passes over the same candidates in reversed "
+                "presentation order. Measures the critic's own stability, "
+                "not its correctness."
+            ),
+        }
 
     @staticmethod
     def _merge(findings: Iterable[Finding]) -> List[Finding]:
