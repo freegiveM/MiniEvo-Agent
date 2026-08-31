@@ -40,6 +40,81 @@ RULE_TO_CWE = {
 }
 
 
+# ── 命中口径：三档，不是一档 ─────────────────────────────────────────────
+#
+# 原实现只有一档：路径 + 行窗口 + **CWE 号完全相等**。这一档太严，会把
+# 正确的发现判成漏报：RULE_TO_CWE["SEC-EVAL"] == "CWE-95"，而数据集给
+# injection 类标的是 CWE-78。reviewer 正确指出了 `eval(` 这一行，却因为
+# CWE 号不同而不算命中。但 CWE 是有层级的——74（注入）之下有 77/78/89/94/95，
+# 它们是兄弟。要求兄弟节点号码相等，测的是"标注者和 reviewer 是否选了同一个
+# 兄弟节点"，不是"reviewer 是否发现了这个缺陷"。
+#
+# 三档各自回答一个不同的问题，所以要分别报数而不是取一个：
+#
+#   location  路径 + 行窗口 ≤ tolerance
+#             → "有没有指到出问题的那几行" = 定位能力
+#   category  location + CWE 同族（八类之一）
+#             → "有没有认出这是哪类问题" = 归因能力
+#   cwe-exact location + CWE 号完全相等
+#             → "CWE 编号是否一致"，**只在 CVE/GHSA 子集上有意义**：
+#                那里的 CWE 来自安全公告，是权威的；其余样本的 CWE 由
+#                分类器推断，拿它做严格比较是在测分类器而非 reviewer。
+#
+# 单调性：strict 的边集是 location 边集的子集，因此
+# cwe-exact ≤ category ≤ location 恒成立。有单测锁住这条不变量——
+# 它被破坏说明某一档的边构造写错了。
+
+MATCH_LOCATION = "location"
+MATCH_CATEGORY = "category"
+MATCH_CWE_EXACT = "cwe-exact"
+MATCH_TIERS = (MATCH_LOCATION, MATCH_CATEGORY, MATCH_CWE_EXACT)
+
+# CWE → 八个缺陷族。族的划分与 dataset_builder.DEFECT_CLASSES 对齐
+# （同一套八类），但**刻意不 import 它**：评测口径不该依赖数据集构造模块，
+# 否则给采集器加一类缺陷会回溯改变历史评测结果，使数字不可比。
+CWE_FAMILY = {
+    # crypto-weak
+    "CWE-326": "crypto-weak", "CWE-327": "crypto-weak", "CWE-328": "crypto-weak",
+    "CWE-330": "crypto-weak", "CWE-295": "crypto-weak", "CWE-916": "crypto-weak",
+    "CWE-757": "crypto-weak",
+    # injection（CWE-74 族 + 反序列化 + 日志注入）
+    "CWE-74": "injection", "CWE-77": "injection", "CWE-78": "injection",
+    "CWE-88": "injection", "CWE-89": "injection", "CWE-90": "injection",
+    "CWE-91": "injection", "CWE-94": "injection", "CWE-95": "injection",
+    "CWE-917": "injection", "CWE-502": "injection", "CWE-117": "injection",
+    # secret-exposure
+    "CWE-200": "secret-exposure", "CWE-312": "secret-exposure",
+    "CWE-522": "secret-exposure", "CWE-532": "secret-exposure",
+    "CWE-798": "secret-exposure", "CWE-614": "secret-exposure",
+    # path-traversal
+    "CWE-22": "path-traversal", "CWE-23": "path-traversal",
+    "CWE-36": "path-traversal", "CWE-73": "path-traversal",
+    # auth-bypass
+    "CWE-285": "auth-bypass", "CWE-287": "auth-bypass", "CWE-306": "auth-bypass",
+    "CWE-862": "auth-bypass", "CWE-863": "auth-bypass", "CWE-617": "auth-bypass",
+    # resource-leak
+    "CWE-400": "resource-leak", "CWE-401": "resource-leak",
+    "CWE-404": "resource-leak", "CWE-664": "resource-leak",
+    "CWE-772": "resource-leak", "CWE-835": "resource-leak",
+    "CWE-377": "resource-leak",
+    # logic-boundary
+    "CWE-20": "logic-boundary", "CWE-125": "logic-boundary",
+    "CWE-193": "logic-boundary", "CWE-682": "logic-boundary",
+    "CWE-703": "logic-boundary", "CWE-787": "logic-boundary",
+    # concurrency
+    "CWE-362": "concurrency", "CWE-366": "concurrency",
+    "CWE-367": "concurrency", "CWE-543": "concurrency",
+    # 刻意未映射：CWE-601（开放重定向）等落在八类之外的编号。
+    # 未映射 → 永不 category 命中，这是正确行为：reviewer 报了一个不在
+    # 本数据集标注体系里的类别，不该算作"认出了这类问题"。
+}
+
+
+def cwe_family(cwe: str) -> str:
+    """Map a CWE id to one of the eight defect families, or '' when unknown."""
+    return CWE_FAMILY.get(str(cwe).strip().upper(), "")
+
+
 @dataclass
 class Match:
     expected_index: int
@@ -117,19 +192,40 @@ def _normalized_path(path: str) -> str:
 
 def _candidate_edges(
     expected: List[dict], predicted: List[Finding], line_tolerance: int,
+    tier: str = MATCH_CWE_EXACT,
 ) -> Dict[int, List[Tuple[int, int]]]:
+    """Build the bipartite edge set for one hit tier.
+
+    tier 默认 MATCH_CWE_EXACT，与改动前的行为完全一致——现有调用方
+    （evaluation_v2、evolution_proof、EndToEndEvaluationHarness）不传 tier 时
+    行为不变，历史数字仍可复算。新口径通过显式传 tier 使用。
+    """
+    if tier not in MATCH_TIERS:
+        raise ValueError("unknown match tier: %s" % tier)
     edges: Dict[int, List[Tuple[int, int]]] = {}
     for expected_index, truth in enumerate(expected):
         start = int(truth["start_line"])
         end = int(truth["end_line"])
         truth_path = _normalized_path(str(truth["path"]))
         truth_cwe = str(truth["cwe"]).upper()
+        truth_family = cwe_family(truth_cwe)
         options = []
         for predicted_index, finding in enumerate(predicted):
             if _normalized_path(finding.path) != truth_path:
                 continue
-            if RULE_TO_CWE.get(finding.rule_id, finding.rule_id).upper() != truth_cwe:
+            finding_cwe = RULE_TO_CWE.get(finding.rule_id, finding.rule_id).upper()
+            if tier == MATCH_CWE_EXACT and finding_cwe != truth_cwe:
                 continue
+            if tier == MATCH_CATEGORY:
+                finding_family = cwe_family(finding_cwe)
+                # 双方都要能映射到族且同族。truth 映射不出族时（数据集用了
+                # 八类之外的 CWE）退回严格相等，而不是放任全部命中——
+                # 无族信息时"同族"这个概念没有定义，宁可保守。
+                if not truth_family:
+                    if finding_cwe != truth_cwe:
+                        continue
+                elif finding_family != truth_family:
+                    continue
             if start <= finding.line <= end:
                 distance = 0
             else:
@@ -142,9 +238,15 @@ def _candidate_edges(
 
 def one_to_one_match(
     expected: List[dict], predicted: List[Finding], line_tolerance: int = 2,
+    tier: str = MATCH_CWE_EXACT,
 ) -> List[Match]:
-    """Maximum-cardinality bipartite matching with deterministic edge ordering."""
-    edges = _candidate_edges(expected, predicted, line_tolerance)
+    """Maximum-cardinality bipartite matching with deterministic edge ordering.
+
+    匹配算法本身**未改动**（计划要求"保留 one_to_one_match 不动"）：
+    仍是最大基数二分匹配 + 受约束真值优先。改的只是喂给它的边集来自哪一档。
+    这个分层是刻意的——命中口径是可以争论的，匹配算法不该跟着一起动。
+    """
+    edges = _candidate_edges(expected, predicted, line_tolerance, tier)
     prediction_owner: Dict[int, int] = {}
 
     def assign(expected_index: int, visited: set) -> bool:
@@ -171,6 +273,52 @@ def one_to_one_match(
         )
         matches.append(Match(expected_index, predicted_index, distance))
     return sorted(matches, key=lambda item: (item.expected_index, item.predicted_index))
+
+
+def tiered_match(
+    expected: List[dict], predicted: List[Finding], line_tolerance: int = 2,
+) -> Dict[str, dict]:
+    """Score one case at all three hit tiers plus the out-of-label count.
+
+    ## 口径纪律：标注外 finding 不是"误报"
+
+    `unlabelled` 统计的是"落在标注之外的 finding"。它**不等于误报**——
+    数据集只标注了反转出来的那个种子缺陷，仓库里可能真有别的问题，
+    reviewer 指出它们是对的。把这个数写成"误报"是口径造假。
+
+    要得到真实的误报率必须靠人工复核（D5 的 rubric + 抽样），
+    自动层只能报"噪声量"（每 PR 的标注外条数）。所以这里的字段名是
+    `unlabelled` 而不是 `false_positives`——名字本身就是口径纪律。
+
+    ## 为什么分档报而不取一个数
+
+    三档回答三个不同的问题（定位 / 归因 / CWE 号一致）。取一个数会让
+    "定位对了但归类错了"和"完全没找到"变成同一个数字，而这两件事对系统
+    改进的指示完全不同：前者要改 prompt 的分类部分，后者要改扫描覆盖。
+    """
+    total_predicted = len(predicted)
+    result: Dict[str, dict] = {}
+    matched_by_tier: Dict[str, set] = {}
+    for tier in MATCH_TIERS:
+        matches = one_to_one_match(expected, predicted, line_tolerance, tier)
+        matched_by_tier[tier] = {item.predicted_index for item in matches}
+        result[tier] = {
+            "tp": len(matches),
+            "fn": len(expected) - len(matches),
+            "matched_expected": sorted(item.expected_index for item in matches),
+        }
+    # 标注外条数按最宽的一档（location）算：一个 finding 只要指对了行，
+    # 就不该被算成"标注外"，即使它把类别判错了。按严格档算会虚增噪声量。
+    result["unlabelled"] = {
+        "count": total_predicted - len(matched_by_tier[MATCH_LOCATION]),
+        "total_predicted": total_predicted,
+        "note": (
+            "Findings outside the labelled seed defect. NOT false positives: "
+            "the dataset only labels the reverted seed, and a reviewer may be "
+            "correctly reporting a genuine unrelated issue."
+        ),
+    }
+    return result
 
 
 class FixtureRepairer:
