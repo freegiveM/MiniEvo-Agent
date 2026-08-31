@@ -137,14 +137,25 @@ class PhaseImplementationTests(unittest.TestCase):
             parse_unified_patch(patch.replace("app.py", "../app.py"), ["../app.py"])
 
     def test_fix_success_requires_before_after_test_evidence(self):
+        """没有 before/after 测试证据就不可能判通过。
+
+        本测试原先还断言"基线绿 + 补丁后绿 ⇒ 通过"，那锁住的是一个语义 bug：
+        它要求基线已经全绿，而修复场景里**存在缺陷时基线本该是红的**，
+        于是真正修好 bug 的补丁反被判 blocked（详见 RepairVerifier.compare
+        的文档与 tests/test_verifier_compare.py）。那条断言同时意味着
+        "什么都没修好的补丁也能过关"。已移除，语义改由
+        test_verifier_compare.py 系统覆盖。
+        """
         self.assertFalse(RepairVerifier.compare(
             {"passed": True, "checks": []}, {"passed": True, "checks": []}
         )["passed"])
-        result = RepairVerifier.compare(
+        no_change = RepairVerifier.compare(
             {"passed": True, "checks": [{"name": "repository-tests", "passed": True}]},
             {"passed": True, "checks": [{"name": "repository-tests", "passed": True}]},
         )
-        self.assertTrue(result["passed"])
+        self.assertTrue(no_change["test_evidence_present"])
+        # 绿 → 绿：零收益，没有理由发布这个补丁。
+        self.assertFalse(no_change["passed"])
 
     def test_real_dataset_gate_requires_300_repository_isolated_prs(self):
         cases = []
