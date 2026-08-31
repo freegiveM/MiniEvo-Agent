@@ -2,8 +2,9 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 from .models import ReviewReport, TaskState, TraceEvent
 
@@ -12,16 +13,46 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class _ClosingConnection:
+    """让 `with` 同时负责事务边界和连接归还。
+
+    sqlite3.Connection 的 __exit__ 只做 commit/rollback，不 close。
+    这个包装保留原有语义（异常回滚、正常提交），并在退出时关闭连接，
+    使全部 60 余处 `with self._connect() as conn:` 调用点一次性修好，
+    无需逐处改写。
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn.__enter__()
+
+    def __exit__(self, exc_type, exc, tb) -> Optional[bool]:
+        try:
+            return self._conn.__exit__(exc_type, exc, tb)
+        finally:
+            self._conn.close()
+
+
 class TaskStore:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
         self._init()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
+        """返回一个用完即关的连接上下文。
+
+        注意 sqlite3.Connection 自身的 __exit__ 只提交/回滚事务，并不关闭连接
+        （见 CPython sqlite3 文档）。早先这里直接 `with self._connect() as conn:`，
+        每次调用都泄漏一个文件句柄，Windows 上表现为测试 tearDown 删除临时 .db 时
+        抛 PermissionError [WinError 32]。用 closing() 包一层，使 with 退出时
+        既结束事务也归还句柄。
+        """
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        return conn
+        return _ClosingConnection(conn)
 
     def _init(self) -> None:
         with self._connect() as conn:

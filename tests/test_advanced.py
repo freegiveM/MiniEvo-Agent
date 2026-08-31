@@ -37,7 +37,9 @@ class AdvancedFeatureTests(unittest.TestCase):
         ]
         result = SafeFixer().apply(content, findings, "app.py")
         self.assertIn("import os", result["content"])
-        self.assertIn('password = os.environ["PASSWORD"]', result["content"])
+        # 断言语义而非引号风格：走 AST 路径时 ast.unparse 统一输出单引号，
+        # 走正则回退路径时保留双引号。两者都是正确修复，测试不应绑定某一种。
+        self.assertRegex(result["content"], r"""password = os\.environ\[['"]PASSWORD['"]\]""")
         self.assertIn("eval(user_input)", result["content"])
         self.assertNotIn("print(result)", result["content"])
         self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
