@@ -51,6 +51,13 @@ context."""
 CRITIC_PROMPT = """You are the Critic Agent performing a blind review. Candidate source identities
 are removed. Search for counterexamples, wrong locations, missing preconditions and unsupported
 severity. Independently use factual tools when needed, or finish directly. Never create new findings.
+Each candidate may carry "missing_evidence": these are evidence types a downstream deterministic
+gate could not find. They are NOT verdicts and NOT instructions to reject. Treat each one as a
+target: if the finding looks real, spend a tool call to supply that evidence and keep it. Rejecting
+a finding solely because it has missing_evidence is a failure of your role.
+"specialist_activity" reports which tools the upstream reviewers actually invoked. A candidate whose
+evidence_refs cite tools absent from that list is self-reported, not verified. A reviewer with
+"stopped_early": true was cut off by its budget, so its silence is not evidence of absence.
 Return JSON only. Tool action: {"action":"tool","tool":"name","arguments":{},"reason":"..."}
 Final action: {"action":"final","decisions":[{"finding_index":0,"accepted":true,
 "objections":["..."],"confidence_adjustment":0.0,"supporting_evidence_ids":["tool:id"]}]}"""
@@ -99,6 +106,70 @@ def _collect_evidence(observations: List[dict]) -> Dict[str, dict]:
                 )[:2000],
             }
     return values
+
+
+def specialist_activity(ledger: ExecutionLedger, roles: Iterable[str]) -> List[dict]:
+    """把各 specialist 的 trace 压成 critic 能用的活动摘要。
+
+    critic 需要这个来回答一个它单看候选缺陷回答不了的问题：
+    **这条结论是查出来的，还是猜出来的。**
+
+    候选缺陷里的 evidence_refs 是 specialist 自己填的，它可以填一个
+    根本没调过的工具名。trace 是执行侧记录的，两者不一致就说明
+    evidence_refs 不可信。所以这里报的是"实际调了哪些工具"，
+    而不是"声称有哪些证据"。
+
+    budget_exhausted 单独报：预算耗尽的 specialist 是**中途停下**的，
+    它没报的问题不等于不存在。critic 不知道这件事就会把"没查完"
+    误读成"查过了没问题"。
+    """
+    traces = ledger.summary(include_trace=True)["agent_traces"]
+    activity = []
+    for role in roles:
+        events = traces.get(role) or []
+        if not events:
+            continue
+        tools_used = [item.get("tool") for item in events
+                      if item.get("event") == "tool_observation" and item.get("tool")]
+        failed = [item.get("tool") for item in events
+                  if item.get("event") == "tool_observation" and not item.get("ok")]
+        activity.append({
+            "role": role,
+            "tools_invoked": sorted(set(tools_used)),
+            "tool_calls": len(tools_used),
+            "failed_tool_calls": len(failed),
+            "steps": max((int(item.get("step") or 0) for item in events), default=0),
+            # 真值：这个 specialist 是正常收尾还是被预算掐断的
+            "stopped_early": any(item.get("event") == "budget_exhausted"
+                                 for item in events),
+        })
+    return activity
+
+
+def gate_gaps(findings: List[Finding], parsed: ParsedDiff, gate) -> Dict[int, List[str]]:
+    """空跑一遍 gate，把每条候选缺的证据类型交给 critic。
+
+    gate 是纯计算（无模型、无工具调用），空跑一次的成本可以忽略，
+    所以不必为了这个把 gate 挪到 critic 之前——挪了会改变
+    "critic 看到的是全部候选"这个前提。
+
+    **口径很重要**：给 critic 的是"缺什么证据"，不是"会被拒"。
+    两种写法的行为完全不同：
+      - 写成"会被拒" → critic 顺着 gate 的判定走，两道关卡塌成一道，
+        独立性没了，加这个信息反而让整体变差。
+      - 写成"缺什么" → critic 知道该往哪儿花工具预算，可能补上证据把
+        这条**救回来**（gate 说缺 AST 证据，critic 去跑 ast_analyze）。
+    后者才是这个反馈回路的意义：gate 指出缺口，critic 去补，
+    而不是 gate 提前替 critic 做决定。
+    """
+    probe = gate.apply(list(findings), parsed)
+    del probe                     # 只要副作用：每条 finding 上挂好的 gate 字段
+    gaps: Dict[int, List[str]] = {}
+    for index, finding in enumerate(findings):
+        reasons = (finding.gate or {}).get("reasons") or []
+        if reasons:
+            gaps[index] = list(reasons)
+    return gaps
 
 
 class BoundedRole:
@@ -470,6 +541,10 @@ class ModeRouterReviewer(Reviewer):
         pre_critic_candidates = len(candidates)
         critic_decisions = []
         position_consistency: Dict[str, Any] = {}
+        # 在分支外先算：critic 没跑时这份摘要仍然有价值（能看出 specialist
+        # 是不是被预算掐断的），而且它只读已发生的 trace，不产生任何调用。
+        activity = specialist_activity(
+            ledger, ("planner", "security", "correctness-reliability"))
         if "critic" in enabled and candidates:
             # 呈现顺序打乱，判定结果映射回规范顺序。见 _presentation_order。
             order = self._presentation_order(len(candidates), diff)
@@ -480,16 +555,22 @@ class ModeRouterReviewer(Reviewer):
                 ), self.client,
                 self._token_budget("critic"), self.default_time_budget,
             )
+            # gate 的证据缺口。和 activity 一样只读已发生的执行 / 纯计算，
+            # 不产生新的模型调用，所以这个回路不加成本。
+            gaps = gate_gaps(candidates, parsed, self.gate)
             result = self._run_critic(
-                critic, candidates, order, diff, suite, ledger,
+                critic, candidates, order, diff, suite, ledger, activity, gaps,
             )
             critic_evidence = _collect_evidence(result.get("_observations") or [])
             by_index = self._decisions_by_canonical_index(result, order)
             if self.critic_position_check:
                 # 反序复核：同一批候选、同一个 critic，只改呈现顺序。
                 reversed_order = list(reversed(order))
+                # 反序复核必须喂**同样的**两路输入。少喂一路的话，
+                # 两次的差异就混进了"输入不同"，测不出位置敏感性。
                 recheck = self._run_critic(
                     critic, candidates, reversed_order, diff, suite, ledger,
+                    activity, gaps,
                 )
                 position_consistency = self._position_consistency(
                     by_index,
@@ -518,8 +599,32 @@ class ModeRouterReviewer(Reviewer):
                 critic_decisions.append({
                     "finding_index": index, "accepted": True,
                     "objections": decision.get("objections") or [],
+                    # 这条进 critic 时缺证据吗。用来算下面的 rescue 口径。
+                    "had_evidence_gap": index in gaps,
                 })
             candidates = accepted
+            # 这个回路有没有用，必须能量出来，否则只是"看起来更聪明"。
+            # 三个数分开报：
+            #   gap 数    —— gate 空跑时有多少条缺证据
+            #   救回数    —— 其中被 critic 留下的（补证据或判定 gate 过严）
+            #   砍掉数    —— 其中被 critic 否掉的
+            # 救回的那些**还要再过一遍真 gate**，真过了才算数，
+            # 所以这里只报 critic 侧的口径，最终数看 gates.accepted。
+            gap_kept = sum(1 for item in critic_decisions
+                           if item.get("accepted") and item.get("had_evidence_gap"))
+            evidence_feedback = {
+                "candidates_with_gap": len(gaps),
+                "gap_candidates_kept_by_critic": gap_kept,
+                "gap_candidates_dropped_by_critic": len(gaps) - gap_kept,
+            }
+        else:
+            # critic 没跑时这三个数是**没测**而不是 0：没有 critic 就没有
+            # 这个回路，报 0 会被读成"回路跑了但一条都没救回来"。
+            evidence_feedback = {
+                "candidates_with_gap": None,
+                "gap_candidates_kept_by_critic": None,
+                "gap_candidates_dropped_by_critic": None,
+            }
         roles = [name for name in ("planner", "security", "correctness-reliability", "critic") if name in enabled]
         collaboration = {
             "protocol": "planner-specialists-blind-critic",
@@ -530,6 +635,10 @@ class ModeRouterReviewer(Reviewer):
             "accepted_findings": len(candidates),
             "critic_decisions": critic_decisions,
             "position_consistency": position_consistency,
+            "evidence_feedback": evidence_feedback,
+            # critic 看到的上游执行情况。入库是为了事后能回答
+            # "这条为什么被留下"——只看决定看不出它依据的是什么。
+            "specialist_activity": activity,
         }
         components = scanner_components + [
             component(
@@ -579,6 +688,8 @@ class ModeRouterReviewer(Reviewer):
     def _run_critic(
         self, critic: "BoundedRole", candidates: List[Finding],
         order: List[int], diff: str, suite, ledger: ExecutionLedger,
+        activity: Optional[List[dict]] = None,
+        gaps: Optional[Dict[int, List[str]]] = None,
     ) -> Dict[str, Any]:
         """Present candidates in `order` and return the critic's raw result.
 
@@ -599,11 +710,19 @@ class ModeRouterReviewer(Reviewer):
                 "call_chain": candidates[index].call_chain,
                 "fix": candidates[index].fix, "test": candidates[index].test,
                 "confidence": candidates[index].confidence,
+                # 缺口按**呈现位置**挂在候选上，不另开一个以规范下标为键的字典。
+                # 那样等于把规范顺序泄露给 critic，前面打乱就白做了。
+                "missing_evidence": (gaps or {}).get(index, []),
             }
             for position, index in enumerate(order)
         ]
+        payload = {"diff": diff, "candidates": blinded}
+        if activity:
+            # specialist 的实际执行情况。放在候选之外的顶层，因为它是
+            # 跨候选的上下文（谁查到什么程度），不属于任何单条候选。
+            payload["specialist_activity"] = activity
         return critic.run(
-            json.dumps({"diff": diff, "candidates": blinded}, ensure_ascii=False),
+            json.dumps(payload, ensure_ascii=False),
             suite.registry("critic", ROLE_PERMISSIONS["critic"]), ledger,
         )
 
