@@ -48,15 +48,29 @@ API = "https://api.github.com"
 USER_AGENT = "evoagent-reverted-fix-collector"
 RATE_FLOOR = 50          # 剩余配额低于此值就等重置，留余量给并发的其他调用
 PAGE_SIZE = 100
+# 未认证配额是 60/小时。留 10 次余量给手工排查，别把配额刚好用干。
+PILOT_BUDGET = 50
+
+
+class BudgetExhausted(Exception):
+    """请求预算用尽。pilot 模式用它干净地收尾，而不是让配额在半路报 403。"""
 
 
 class GitHub:
-    def __init__(self, token: str, cache_dir: str, verbose: bool = True) -> None:
+    def __init__(
+        self, token: str, cache_dir: str, verbose: bool = True,
+        max_requests: int = 0, rate_floor: int = RATE_FLOOR,
+    ) -> None:
         self.token = token
         self.cache_dir = cache_dir
         self.verbose = verbose
         self.requests = 0
         self.cache_hits = 0
+        self.max_requests = max_requests        # 0 = 不限
+        # 为什么 floor 要可调：未认证上限就是 60，固定 floor=50 会让第 10 次
+        # 请求就触发"配额将尽"而睡到下个小时——pilot 永远跑不完。pilot 有自己
+        # 的硬上限，floor 的职责（给其他调用方留余量）已由硬上限承担。
+        self.rate_floor = rate_floor
         os.makedirs(cache_dir, exist_ok=True)
 
     def _headers(self, accept: str) -> dict:
@@ -70,6 +84,9 @@ class GitHub:
         return headers
 
     def _get(self, url: str, accept: str) -> str:
+        # 预算检查放在发请求之前：超了就一次都不发。放在之后就等于允许超一次。
+        if self.max_requests and self.requests >= self.max_requests:
+            raise BudgetExhausted("used %d requests" % self.requests)
         request = urllib.request.Request(url, headers=self._headers(accept))
         for attempt in range(4):
             try:
@@ -112,7 +129,7 @@ class GitHub:
         reset = headers.get("X-RateLimit-Reset")
         if not (remaining and str(remaining).isdigit()):
             return
-        if int(remaining) > RATE_FLOOR:
+        if int(remaining) > self.rate_floor:
             return
         wait = 60
         if reset and str(reset).isdigit():
@@ -179,6 +196,12 @@ def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple
                 break
             try:
                 pulls = client.list_merged_pulls(repository, page)
+            except BudgetExhausted as exc:
+                # 预算用尽不是失败：已采到的 case 和已统计的淘汰原因都有效，
+                # 照常返回让上层出报告。抛到最外层会丢掉这一轮的全部成果。
+                print("\n[budget] %s — stopping early, keeping what we have"
+                      % exc, flush=True)
+                return cases, rejections
             except LookupError as exc:
                 print("  skipping repository: %s" % exc, flush=True)
                 break
@@ -190,6 +213,10 @@ def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple
                 number = int(item["number"])
                 try:
                     diff = client.pull_diff(repository, number)
+                except BudgetExhausted as exc:
+                    print("\n[budget] %s — stopping early, keeping what we have"
+                          % exc, flush=True)
+                    return cases, rejections
                 except LookupError:
                     rejections["diff-unavailable"] = rejections.get("diff-unavailable", 0) + 1
                     continue
@@ -274,6 +301,17 @@ def main() -> int:
                         help="stop after this many cases; overrides repos.yaml")
     parser.add_argument("--report-only", action="store_true",
                         help="re-report an existing JSONL without collecting")
+    parser.add_argument(
+        "--pilot", nargs="?", type=int, const=PILOT_BUDGET, default=0,
+        metavar="N",
+        help=("Run a hard-capped pilot of at most N requests (default %d) and "
+              "allow running without GITHUB_TOKEN. This exists to verify the "
+              "live paging/filtering path and to measure the real rejection "
+              "funnel rate before spending a full authenticated run. The "
+              "output is NOT the dataset: it is written to --output with a "
+              "'.pilot' suffix so it cannot be mistaken for one."
+              % PILOT_BUDGET),
+    )
     args = parser.parse_args()
 
     if args.report_only:
@@ -286,18 +324,31 @@ def main() -> int:
     target = args.target or int(plan.get("target_total", 100))
 
     token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
+    if not token and not args.pilot:
         # 不静默降级：未认证 60 次/小时，采 100 个 PR 要跑十几个小时且大概率
-        # 中途失败。宁可现在就说清楚。
+        # 中途失败。宁可现在就说清楚。--pilot 是显式的例外，见其 help。
         print(
             "GITHUB_TOKEN is not set. Unauthenticated GitHub allows 60 requests/hour, "
             "which is not enough for ~650 requests. Set a token (no scopes needed "
-            "for public repositories) and re-run.",
+            "for public repositories) and re-run, or use --pilot to run a "
+            "hard-capped verification pass that does not produce the dataset.",
             file=sys.stderr,
         )
         return 2
 
-    client = GitHub(token, args.cache)
+    if args.pilot:
+        # pilot 的产出必须无法被误当成数据集。改文件名而不是加字段：
+        # 字段会被下游忽略，文件名不会。
+        args.output = args.output + ".pilot"
+        print("PILOT MODE: at most %d requests, %s auth, writing %s"
+              % (args.pilot, "with" if token else "WITHOUT", args.output))
+
+    client = GitHub(
+        token, args.cache,
+        max_requests=args.pilot,
+        # 未认证时 floor 必须降到 0，否则第 10 次请求就睡到下个小时。
+        rate_floor=RATE_FLOOR if token else 0,
+    )
     started = time.time()
     cases, rejections = collect(client, plan, cutoff, target)
 
