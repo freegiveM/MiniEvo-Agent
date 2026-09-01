@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import re
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .diff_parser import parse_unified_diff
 from .evaluation_benchmark import ContextRuleReviewer
@@ -203,10 +203,16 @@ def _metric_delta(candidate: dict, baseline: dict) -> dict:
         "score", "precision", "recall", "f1", "severity_accuracy",
         "high_severity_recall", "clean_accuracy", "success_rate",
     )
-    return {
-        name: round(float(candidate[name]) - float(baseline[name]), 4)
-        for name in names
-    }
+
+    def delta(name: str) -> Optional[float]:
+        # 任一端是 None → 差值 None。拿 None 当 0 会造出一个"提升了 40pp"
+        # 的假数字，而实际是"其中一次根本没测"。
+        left, right = candidate[name], baseline[name]
+        if left is None or right is None:
+            return None
+        return round(float(left) - float(right), 4)
+
+    return {name: delta(name) for name in names}
 
 
 def run_prompt_evolution_proof(dataset_path: str, database_path: str) -> Dict[str, Any]:
@@ -331,13 +337,18 @@ def run_prompt_evolution_proof(dataset_path: str, database_path: str) -> Dict[st
 
 
 def render_markdown(report: Dict[str, Any]) -> str:
-    def pct(value: float) -> str:
+    def pct(value: Optional[float]) -> str:
+        # None 渲染成 n/a："这一档没有样本，得不出结论"。渲染成 0.00% 会被
+        # 读成"测了一条没中"，那是个结论；渲染成 100.00% 更糟。
+        if value is None:
+            return "n/a"
         return "%.2f%%" % (100.0 * float(value))
 
     def row(label: str, key: str, block: dict) -> str:
-        return "| %s | %s | %s | %+.2f pp |" % (
+        delta = block["delta"][key]
+        return "| %s | %s | %s | %s |" % (
             label, pct(block["baseline"][key]), pct(block["candidate"][key]),
-            100.0 * block["delta"][key],
+            "n/a" if delta is None else "%+.2f pp" % (100.0 * delta),
         )
 
     lines = [

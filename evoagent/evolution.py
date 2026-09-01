@@ -57,6 +57,48 @@ DEFAULT_EVALUATION_CASES = [
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
+def _ratio(numerator: int, denominator: int) -> Optional[float]:
+    """分母为 0 时给 None，不给 1.0 也不给 0.0。
+
+    三个数各不相同，混用会编造结论：
+      - 0.0 = 测过了，一条没中（这是个结论）
+      - 1.0 = 测过了，全中（这也是个结论）
+      - None = 没有样本，得不出结论
+
+    与 evaluation_harness._metrics 的 `ratio(..., empty=None)` 同一口径。
+    """
+    if denominator <= 0:
+        return None
+    return numerator / denominator
+
+
+def _round(value: Optional[float]) -> Optional[float]:
+    """round() 对 None 会抛，指标层要能原样透传 None。"""
+    return None if value is None else round(value, 4)
+
+
+def _metric_non_regressing(
+    candidate: Optional[float], baseline: Optional[float], margin: float,
+) -> bool:
+    """单个受保护指标的未回退判定，对 None 做非对称处理。
+
+    - baseline 是 None：这一档 baseline 本来就没测过，无从回退 → 放行。
+    - baseline 有数、candidate 是 None：**拦**。候选把一个原本可测的指标变
+      成测不出来了（比如一条 finding 都不报 → precision 无定义），这是实质
+      回退，不是"不适用"。把它当放行就是本次修的那个漏洞的镜像。
+    - 两边都有数：照常比。
+
+    为什么不直接 skip 掉所有 None：`all()` 对空序列返回 True。若把 None 一律
+    跳过，一份指标全 None 的评测会得到"全部门禁通过"，正是三态门禁纪律里
+    「None 当 True 就是静默放行」要禁止的形态。
+    """
+    if baseline is None:
+        return True
+    if candidate is None:
+        return False
+    return float(candidate) + margin >= float(baseline)
+
+
 class RegressionEvaluator:
     """Replay a fixed dataset against one prompt and compute objective review metrics."""
 
@@ -146,27 +188,33 @@ class RegressionEvaluator:
                     "error": str(exc)[:500],
                 })
 
-        precision = (
-            true_positive / (true_positive + false_positive)
-            if true_positive + false_positive else (1.0 if true_positive + false_negative == 0 else 0.0)
+        # 空分母口径：没有样本 → None（无法得出结论），不是 1.0（满分）也不是
+        # 0.0（测过了没中）。原先 recall/clean_accuracy/high_severity_recall 在
+        # 分母为 0 时返回 1.0，这会让 `_non_regressing` 拿一个编造的满分去比
+        # 真实 baseline 并判"未回退"。反转 fix PR 的每个 case 都带种子缺陷，
+        # 所以真实数据集上 clean_total 恒为 0——这个 bug 到 D6 必然触发。
+        precision = _ratio(true_positive, true_positive + false_positive)
+        recall = _ratio(true_positive, true_positive + false_negative)
+        # f1 直接由混淆矩阵算，不走 precision/recall 的乘积——后者只要有一边
+        # 是 None 就得整体 None，而 2tp/(2tp+fp+fn) 只要有过预测或有过真值
+        # 就有定义。
+        f1 = _ratio(
+            2 * true_positive, 2 * true_positive + false_positive + false_negative
         )
-        recall = (
-            true_positive / (true_positive + false_negative)
-            if true_positive + false_negative else 1.0
-        )
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        severity_accuracy = severity_hits / matched if matched else (1.0 if not false_negative else 0.0)
-        clean_accuracy = clean_hits / clean_total if clean_total else 1.0
-        high_severity_recall = (
-            high_severity_hits / high_severity_total if high_severity_total else 1.0
-        )
+        severity_accuracy = _ratio(severity_hits, matched)
+        clean_accuracy = _ratio(clean_hits, clean_total)
+        high_severity_recall = _ratio(high_severity_hits, high_severity_total)
         successful_cases = len(cases) - len(errors)
         success_rate = successful_cases / len(cases) if cases else 0.0
+        # None 分量要剔掉再归一化，不能当 0 参与加权——否则"没测"会被算成
+        # "测了得零分"，正是空分母口径要区分的两件事。severity_accuracy 在
+        # expected_total > 0 但 matched == 0（全漏）时就是 None。
         components = []
         if expected_total:
             components.extend(((f1, 0.65), (severity_accuracy, 0.15)))
         if clean_total:
             components.append((clean_accuracy, 0.20))
+        components = [item for item in components if item[0] is not None]
         score = (
             sum(value * weight for value, weight in components)
             / sum(weight for _, weight in components)
@@ -176,13 +224,15 @@ class RegressionEvaluator:
         return {
             "schema_version": 2,
             "reviewer": reviewer_name,
+            # score 保持 float：它是加权聚合，没有分量时 0.0 的含义是"这份数据
+            # 集给不出任何分数"，而调用方用它做 >= 比较，None 会直接抛。
             "score": round(score, 4),
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "f1": round(f1, 4),
-            "severity_accuracy": round(severity_accuracy, 4),
-            "high_severity_recall": round(high_severity_recall, 4),
-            "clean_accuracy": round(clean_accuracy, 4),
+            "precision": _round(precision),
+            "recall": _round(recall),
+            "f1": _round(f1),
+            "severity_accuracy": _round(severity_accuracy),
+            "high_severity_recall": _round(high_severity_recall),
+            "clean_accuracy": _round(clean_accuracy),
             "cases": len(cases),
             "positive_cases": sum(bool(case.get("expected")) for case in cases),
             "clean_cases": clean_total,
@@ -577,11 +627,9 @@ class EvolutionEngine:
             protected.append("severity_accuracy")
         if baseline.get("clean_cases", 0):
             protected.append("clean_accuracy")
-        return all(
-            float(candidate.get(metric, 0.0)) + self.max_metric_regression
-            >= float(baseline.get(metric, 0.0))
-            for metric in protected
-        )
+        return all(_metric_non_regressing(
+            candidate.get(metric), baseline.get(metric), self.max_metric_regression,
+        ) for metric in protected)
 
     @staticmethod
     def _redact_holdout_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:

@@ -12,7 +12,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from .diff_parser import parse_unified_diff
-from .evolution import RegressionEvaluator
+from .evolution import RegressionEvaluator, _metric_non_regressing
 from .models import Finding, Severity
 from .reviewer import Reviewer
 from .store import utc_now
@@ -161,10 +161,11 @@ class SkillEvolutionEngine:
             protected.append("severity_accuracy")
         if baseline.get("clean_cases", 0):
             protected.append("clean_accuracy")
-        return all(
-            float(candidate.get(name, 0)) + self.max_metric_regression
-            >= float(baseline.get(name, 0)) for name in protected
-        )
+        # 读的是同一个 RegressionEvaluator 的输出，空分母现在给 None，
+        # float(None) 会抛。复用同一个非对称判定，两处门禁口径必须一致。
+        return all(_metric_non_regressing(
+            candidate.get(name), baseline.get(name), self.max_metric_regression,
+        ) for name in protected)
 
     def status(
         self, skill_name: str = "evolved-review", tenant_id: str = "default",
