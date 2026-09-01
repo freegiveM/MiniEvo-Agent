@@ -146,6 +146,48 @@ def specialist_activity(ledger: ExecutionLedger, roles: Iterable[str]) -> List[d
     return activity
 
 
+def _plan_scopes(
+    task_graph: List[dict], changed_files: List[str],
+) -> Dict[str, Set[str]]:
+    """把 planner 分的 files 变成每个 specialist 的文件范围。
+
+    **兜底方向是刻意选的：分不出来就给全集，不是给空集。**
+    两种失败的代价不对称：
+      - 范围给窄了（漏掉一个文件）→ 那个文件没人看，缺陷漏报，
+        而且**不报错**，看起来像"评审过了没问题"。
+      - 范围给宽了 → 多花点 token，结论不变。
+    所以 planner 没给 files、给了空列表、或给的文件全都不在改动集里时，
+    一律退回改动全集。约束的目的是省 token 和减少串扰，不是当安全边界。
+
+    只保留确实在改动集里的文件：planner 可能凭空编一个路径，
+    放进范围等于给了它一个不存在的许可，事后查越界记录时会误导。
+    """
+    valid = {_scope_key(item) for item in changed_files}
+    scopes: Dict[str, Set[str]] = {}
+    for item in task_graph:
+        name = str(item.get("specialist") or "")
+        if not name:
+            continue
+        listed = item.get("files")
+        if not isinstance(listed, list):
+            continue
+        picked = {_scope_key(str(value)) for value in listed if str(value).strip()}
+        picked &= valid
+        if picked:
+            scopes[name] = picked
+    return scopes
+
+
+def _scope_key(path: str) -> str:
+    """与 repository_tools 的归一化保持同一套规则。
+
+    两处各写一套的话，diff 前缀或分隔符的处理只要差一点，范围检查就
+    在真实数据上失效，而单测里两边都用干净路径，测不出来。
+    """
+    from .repository_tools import _normalise_scope_path
+    return _normalise_scope_path(path)
+
+
 def gate_gaps(findings: List[Finding], parsed: ParsedDiff, gate) -> Dict[int, List[str]]:
     """空跑一遍 gate，把每条候选缺的证据类型交给 critic。
 
@@ -505,6 +547,7 @@ class ModeRouterReviewer(Reviewer):
             str(item.get("specialist")): str(item.get("objective", ""))
             for item in task_graph
         }
+        scopes = _plan_scopes(task_graph, parsed.files)
         specs = []
         if "security" in enabled:
             specs.append(("security", SECURITY_PROMPT + (
@@ -525,14 +568,20 @@ class ModeRouterReviewer(Reviewer):
                         name, prompt, self.client,
                         self._token_budget(name), self.default_time_budget,
                     )
+                    scope = scopes.get(name)
                     context = json.dumps({
                         "objective": objectives.get(name, "Independently review the change."),
+                        # 范围内的文件单独列出来，同时**保留完整的 changed_files**。
+                        # 只给范围内的文件会让 specialist 看不到改动全貌，
+                        # 而判"这个改动有没有引入问题"往往要看相邻改动。
+                        # 范围限制的是能读哪些文件的内容，不是能知道改了什么。
+                        "assigned_files": sorted(scope) if scope else list(parsed.files),
                         "diff": diff, "changed_files": parsed.files,
                         "scanner_findings": shared_scanner_findings,
                     }, ensure_ascii=False)
                     futures[pool.submit(
                         role.run, context,
-                        suite.registry(name, ROLE_PERMISSIONS[name]), ledger,
+                        suite.registry(name, ROLE_PERMISSIONS[name], scope), ledger,
                     )] = name
                 for future in as_completed(futures):
                     name = futures[future]
@@ -629,6 +678,9 @@ class ModeRouterReviewer(Reviewer):
         collaboration = {
             "protocol": "planner-specialists-blind-critic",
             "roles": roles, "task_graph": task_graph,
+            # 实际生效的范围。入库是为了能区分"planner 分了范围"和
+            # "分的范围全被兜底覆盖了"——后者说明 planner 这一步没起作用。
+            "assigned_scopes": {name: sorted(value) for name, value in scopes.items()},
             "scanner_findings": len(rule_findings),
             "llm_candidate_findings": len(findings),
             "candidate_findings_before_critic": pre_critic_candidates,

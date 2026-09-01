@@ -18,6 +18,20 @@ from .runtime import AgentTool, ToolRegistry
 from .telemetry import ExecutionLedger
 
 
+def _normalise_scope_path(path: str) -> str:
+    """归一化用于范围比较的路径。
+
+    必须归一化，否则范围检查会被最普通的写法绕过：diff 里的路径带
+    `a/` `b/` 前缀，Windows 上分隔符是反斜杠。不归一化的话
+    `b/app.py` 与 `app.py` 判成两个文件，约束等于没有。
+    """
+    value = str(path).replace("\\", "/").strip()
+    for prefix in ("a/", "b/", "./"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+    return value
+
+
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "dist", "build", ".venv", "venv"}
 CONFIG_NAMES = {
     "package.json", "package-lock.json", "requirements.txt", "pyproject.toml",
@@ -342,7 +356,19 @@ class RepositoryToolSuite:
                 }
         return _evidence("test", payload)
 
-    def registry(self, role: str, allowed: Optional[Set[str]] = None) -> ToolRegistry:
+    def registry(
+        self, role: str, allowed: Optional[Set[str]] = None,
+        allowed_paths: Optional[Set[str]] = None,
+    ) -> ToolRegistry:
+        """`allowed` 限制**能调哪些工具**，`allowed_paths` 限制**能看哪些文件**。
+
+        两者分开是因为约束来源不同：工具权限是静态的角色定义（写死在
+        ROLE_PERMISSIONS），文件范围是 planner 每次动态分的。
+
+        范围检查放在**工具层**而不是 prompt 里。写在 prompt 里的约束模型
+        可以不理，而且违规了没有痕迹；放在这里，越界调用会被拒并记进
+        ledger，事后能查出"planner 分错了范围"还是"specialist 不守范围"。
+        """
         specs = {
             "list_repository": (
                 "List repository files.",
@@ -412,6 +438,23 @@ class RepositoryToolSuite:
 
             def wrapped(_handler=handler, _name=name, **arguments):
                 started = time.monotonic()
+                if allowed_paths is not None and "path" in arguments:
+                    target = _normalise_scope_path(str(arguments["path"]))
+                    if target not in allowed_paths:
+                        # 拒绝时把**实际范围**告诉它，而不是只说"不许"。
+                        # 只说不许的话，specialist 只能盲试；给出范围它能
+                        # 立刻改到该看的文件上，一次工具预算不白花。
+                        message = (
+                            "path out of assigned scope: %s (assigned: %s)"
+                            % (target, ", ".join(sorted(allowed_paths)) or "none")
+                        )
+                        if self.ledger:
+                            self.ledger.record_tool(
+                                role, _name, arguments, False,
+                                int((time.monotonic() - started) * 1000),
+                                error=message,
+                            )
+                        raise PermissionError(message)
                 try:
                     value = _handler(**arguments)
                     if self.ledger:
