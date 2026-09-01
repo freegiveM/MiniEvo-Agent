@@ -14,6 +14,7 @@ can be unit tested against fixtures.
 `validate_case` 会拒绝。因此本数据集系统性排除 "missing check" 类缺陷，
 只覆盖 "wrong code" 类。这不是实现瑕疵，是构造方法的边界。
 """
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -462,6 +463,78 @@ def label_provenance(title: str, body: str) -> str:
     return "title-keyword"
 
 
+# backport PR 的标题形态，实测来自 aiohttp 首页：
+#   [PR #12787/4eb35886 backport][3.15] fix(connector): resolve race condition
+# 一个修复常被 backport 到 2~3 个维护分支，于是同一个缺陷在数据集里出现
+# 3 次。这不是"多了两条样本"，而是三重危害：
+#   1. 指标被重复样本加权，等于给某个缺陷投了 3 票；
+#   2. validation 与 holdout 若各拿到一份，holdout 就泄漏了；
+#   3. 难度/类别分布被同一个修复扭曲。
+BACKPORT_PATTERN = re.compile(r"(?i)\bbackport\b|^\s*\[\s*\d+\.\d+[\w.]*\s*\]")
+
+
+def _fingerprint_lines(diff: str) -> List[str]:
+    """只取以 +/- 开头的行。
+
+    只留 +/- 行，就同时甩掉了三种噪声，而且是一个条件甩掉的：
+    - hunk 头 @@ -120,7 +120,8 @@ ——backport 到不同分支时同一处修改
+      的行号会偏移，@@ -120 与 @@ -134 描述的是同一个改动，含行号的哈希
+      认不出这对重复。@@ 不以 +/- 开头，自动排除。
+    - index 行的 blob 哈希——不同分支上必然不同，纯噪声。同样自动排除。
+    - 上下文行——backport 时周边代码可能已漂移，但缺陷与修复是同一个。
+
+    曾经额外写了一句 `if line.startswith("@@") or ...: continue`，变异测试
+    证明那是死代码：@@ 和 index 行本来就不以 +/- 开头。删掉它并把理由写在
+    这里，比留着一段永不生效的分支和一句归因错误的注释更好。
+
+    +++/--- 文件头**故意保留**（它们以 +/- 开头）：同一处改动落在不同文件
+    上不算重复，路径必须进指纹。
+    """
+    return [line.rstrip() for line in diff.splitlines()
+            if line.startswith("+") or line.startswith("-")]
+
+
+def diff_fingerprint(diff: str) -> str:
+    """内容级指纹，用于跨 PR 去重。
+
+    与标题模式是**互补**的两道，不是二选一：
+    - 标题模式在抓 diff 前就能拦掉，省请求，但依赖各仓库的命名习惯；
+    - 内容指纹不依赖命名，能抓到"同一修复由不同 PR 分别落地"，
+      但必须先花一次请求拿到 diff。
+    只留其一都会漏：只靠标题会漏掉不写 backport 字样的重复提交，
+    只靠指纹会把该省的请求花掉。
+    """
+    return hashlib.sha1(
+        "\n".join(_fingerprint_lines(diff)).encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+def screen_title(title: str, body: str) -> Optional[str]:
+    """只看标题与正文的淘汰判定，返回淘汰原因或 None（= 通过）。
+
+    为什么单独拆出来：这两条规则**不需要 diff**，而 diff 是采集器唯一
+    要花请求的东西。原先它们只在 build_case 里跑，而 build_case 在
+    pull_diff 之后调用——于是每个 dependabot PR 都要先花一次请求抓 diff
+    再被标题规则淘汰。首轮 pilot 实测：53 次请求里 42 次是这样浪费的。
+
+    标题和正文本来就随 list 端点免费返回，一页 100 条只要 1 次请求。
+    把这两条前移到抓 diff 之前，同样配额能筛的候选数翻倍。
+
+    build_case 仍然调用本函数，保持自身完整（离线单测不依赖采集器）。
+    同一份判定跑两次的代价是两次短字符串正则，可以忽略；换来的是只有
+    一处实现，不会两边漂移。
+    """
+    if BACKPORT_PATTERN.search(title or ""):
+        # 放在 EXCLUDE 之前：backport 标题里常同时含 fix 字样，
+        # 顺序反了会先被判成合格 bugfix。
+        return "backport-duplicate"
+    if EXCLUDE_KEYWORDS.search(title or ""):
+        return "excluded-keyword"
+    if not FIX_KEYWORDS.search("%s\n%s" % (title or "", body or "")):
+        return "not-a-bugfix"
+    return None
+
+
 def build_case(
     pull: PullRequest, split: str, cutoff: str, domain: str = "",
 ) -> dict:
@@ -474,10 +547,9 @@ def build_case(
     title = pull.title or ""
     body = pull.body or ""
 
-    if EXCLUDE_KEYWORDS.search(title):
-        raise CaseRejected("excluded-keyword", title[:80])
-    if not FIX_KEYWORDS.search("%s\n%s" % (title, body)):
-        raise CaseRejected("not-a-bugfix", title[:80])
+    screened = screen_title(title, body)
+    if screened is not None:
+        raise CaseRejected(screened, title[:80])
 
     diff = pull.diff or ""
     if not diff.strip():

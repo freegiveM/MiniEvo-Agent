@@ -40,6 +40,8 @@ from evoagent.dataset_builder import (  # noqa: E402
     CaseRejected,
     PullRequest,
     build_case,
+    diff_fingerprint,
+    screen_title,
     summarise,
 )
 from evoagent.evaluation_harness import validate_case  # noqa: E402
@@ -182,6 +184,9 @@ def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple
     cases = []
     rejections: dict = {}
     default_pages = int((plan.get("defaults") or {}).get("max_pages", 12))
+    # 内容级去重跨仓库共享，不是每仓库一份：切分泄漏恰恰发生在
+    # validation 与 holdout 各拿到同一修复的一份时，per-repo 去重看不见它。
+    seen_fingerprints: dict = {}
 
     for entry in plan["repos"]:
         repository = entry["name"]
@@ -211,6 +216,15 @@ def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple
                 if accepted >= quota:
                     break
                 number = int(item["number"])
+                # 标题级淘汰在抓 diff **之前**做：这两条规则不需要 diff，
+                # 而 diff 是唯一要花请求的东西。首轮 pilot 实测 53 次请求里
+                # 42 次浪费在"抓完 diff 才发现是 dependabot bump"上。
+                # 淘汰原因照常记账，漏斗统计口径不变。
+                screened = screen_title(item.get("title") or "",
+                                        item.get("body") or "")
+                if screened is not None:
+                    rejections[screened] = rejections.get(screened, 0) + 1
+                    continue
                 try:
                     diff = client.pull_diff(repository, number)
                 except BudgetExhausted as exc:
@@ -244,6 +258,17 @@ def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple
                     print("  ! #%d rejected by validate_case: %s" % (number, exc),
                           flush=True)
                     continue
+                # 内容指纹按**反转后的待审 diff**算，也就是 agent 真正看到的
+                # 输入。两条 case 输入相同就是重复，无论它们来自哪个 PR。
+                fingerprint = diff_fingerprint(case["diff"])
+                if fingerprint in seen_fingerprints:
+                    rejections["duplicate-diff"] = (
+                        rejections.get("duplicate-diff", 0) + 1
+                    )
+                    print("  = #%-6d duplicate of %s" % (
+                        number, seen_fingerprints[fingerprint]), flush=True)
+                    continue
+                seen_fingerprints[fingerprint] = case["id"]
                 cases.append(case)
                 accepted += 1
                 print("  + #%-6d %-16s %s  %s" % (

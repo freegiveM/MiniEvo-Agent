@@ -36,6 +36,22 @@ index 1111111..2222222 100644
      return digest
 """
 
+
+def good_diff(seed=0):
+    """每个 PR 一份**内容不同**的 diff。
+
+    为什么需要它：采集器加了内容级去重后，让所有 PR 共用同一个 GOOD_DIFF
+    会被正确地判成重复，配额类测试就失去意义了。这不是去重的 bug——
+    原先的 fixture 不真实：真实世界里不同 PR 的 diff 内容不同，
+    而"内容完全相同的多个 PR"恰恰就是去重要拦的那种情况。
+    改动函数名即可，行号不变，指纹按内容行算。
+    """
+    if not seed:
+        return GOOD_DIFF
+    return GOOD_DIFF.replace("compute_token", "compute_token_%d" % seed).replace(
+        "digest = hashlib", "digest%d = hashlib" % seed
+    ).replace("return digest", "return digest%d" % seed)
+
 FEATURE_DIFF = GOOD_DIFF
 
 
@@ -80,7 +96,7 @@ class CollectTests(unittest.TestCase):
         pulls = [_pull(n) for n in (1, 2, 3, 4, 5)]
         client = FakeGitHub(
             {"octocat/hello": [pulls]},
-            {("octocat/hello", n): GOOD_DIFF for n in (1, 2, 3, 4, 5)},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2, 3, 4, 5)},
         )
         cases, _rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(2, len(cases))
@@ -95,7 +111,7 @@ class CollectTests(unittest.TestCase):
         ]
         client = FakeGitHub(
             {"octocat/hello": [pulls]},
-            {("octocat/hello", n): GOOD_DIFF for n in (1, 2, 3)},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
         )
         cases, rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(1, len(cases))
@@ -124,7 +140,7 @@ class CollectTests(unittest.TestCase):
                 [_pull(1, "Add feature")],      # 整页都被淘汰
                 [_pull(2), _pull(3)],
             ]},
-            {("octocat/hello", n): GOOD_DIFF for n in (1, 2, 3)},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
         )
         cases, _rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(2, len(cases))
@@ -142,7 +158,7 @@ class CollectTests(unittest.TestCase):
                 "octocat/one": [[_pull(1), _pull(2)]],
                 "octocat/two": [[_pull(3), _pull(4)]],
             },
-            {(repo, n): GOOD_DIFF
+            {(repo, n): good_diff(n)
              for repo, n in (("octocat/one", 1), ("octocat/one", 2),
                              ("octocat/two", 3), ("octocat/two", 4))},
         )
@@ -168,13 +184,86 @@ class CollectTests(unittest.TestCase):
                 _pull(1, merged_at="2022-01-01T00:00:00Z"),
                 _pull(2, merged_at="2026-01-01T00:00:00Z"),
             ]]},
-            {("octocat/hello", 1): GOOD_DIFF, ("octocat/hello", 2): GOOD_DIFF},
+            {("octocat/hello", 1): good_diff(1), ("octocat/hello", 2): good_diff(2)},
         )
         cases, _rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(
             {"pre-cutoff", "post-cutoff"},
             {case["contamination_split"] for case in cases},
         )
+
+
+class DedupTests(unittest.TestCase):
+    """内容级去重的编排行为。指纹函数本身的测试在 test_dataset_dedup.py。"""
+
+    def test_two_prs_with_the_same_diff_yield_one_case(self):
+        plan = {"repos": [{"name": "octocat/hello", "split": "validation",
+                           "target_prs": 3}],
+                "defaults": {"max_pages": 1}}
+        client = FakeGitHub(
+            {"octocat/hello": [[_pull(1), _pull(2), _pull(3)]]},
+            # 三个 PR 同一份 diff：真实世界里这就是 backport 或重复落地。
+            {("octocat/hello", n): GOOD_DIFF for n in (1, 2, 3)},
+        )
+        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        self.assertEqual(1, len(cases))
+        self.assertEqual(2, rejections.get("duplicate-diff"))
+
+    def test_dedup_spans_repositories_to_stop_split_leakage(self):
+        """跨仓库去重，不是每仓库一份。
+
+        切分泄漏恰恰发生在 validation 与 holdout 各拿到同一修复的一份时。
+        per-repo 去重看不见它——两个仓库各自都只有一份，都"不重复"。
+        """
+        plan = {"repos": [
+            {"name": "octocat/one", "split": "validation", "target_prs": 1},
+            {"name": "octocat/two", "split": "holdout", "target_prs": 1},
+        ], "defaults": {"max_pages": 1}}
+        client = FakeGitHub(
+            {"octocat/one": [[_pull(1)]], "octocat/two": [[_pull(2)]]},
+            {("octocat/one", 1): GOOD_DIFF, ("octocat/two", 2): GOOD_DIFF},
+        )
+        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        self.assertEqual(1, len(cases))
+        self.assertEqual(1, rejections.get("duplicate-diff"))
+        # 留下的是先遇到的那个，holdout 那份被拦住。
+        self.assertEqual("octocat/one", cases[0]["repository"])
+
+    def test_distinct_diffs_are_all_kept(self):
+        # 去重不能过度：内容不同就都留下。
+        plan = {"repos": [{"name": "octocat/hello", "split": "validation",
+                           "target_prs": 3}],
+                "defaults": {"max_pages": 1}}
+        client = FakeGitHub(
+            {"octocat/hello": [[_pull(1), _pull(2), _pull(3)]]},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
+        )
+        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        self.assertEqual(3, len(cases))
+        self.assertIsNone(rejections.get("duplicate-diff"))
+
+
+class PreScreenTests(unittest.TestCase):
+    """标题级淘汰必须发生在抓 diff 之前，否则白烧配额。"""
+
+    def test_a_bump_pr_costs_no_diff_request(self):
+        plan = {"repos": [{"name": "octocat/hello", "split": "validation",
+                           "target_prs": 2}],
+                "defaults": {"max_pages": 1}}
+        client = FakeGitHub(
+            {"octocat/hello": [[
+                _pull(1, title="Bump click from 8.3.1 to 8.4.1"),
+                _pull(2, title="[PR #9/abc backport][3.1] Fix deadlock"),
+                _pull(3, title="Fix weak hash"),
+            ]]},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
+        )
+        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        self.assertEqual(1, len(cases))
+        # 核心断言：只为第 3 个 PR 抓了 diff。前两个一次请求都没花。
+        self.assertEqual([("octocat/hello", 3)], client.diff_calls)
+        self.assertEqual(1, rejections.get("excluded-keyword"))
+        self.assertEqual(1, rejections.get("backport-duplicate"))
 
 
 class ReportTests(unittest.TestCase):
