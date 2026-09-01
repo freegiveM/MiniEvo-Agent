@@ -11,11 +11,13 @@
 import unittest
 
 from evoagent.dataset_builder import (
+    MAX_FIX_LINES,
     CaseRejected,
     PullRequest,
     build_case,
     classify_defect,
     contamination_split,
+    count_changed_lines,
     count_touched_functions,
     grade_difficulty,
     reverse_unified_diff,
@@ -259,6 +261,109 @@ class BuildCaseTests(unittest.TestCase):
                 build_case(_pull(CRYPTO_FIX, title=title),
                            "validation", "2024-07-01")
             self.assertEqual("excluded-keyword", ctx.exception.reason, title)
+
+    def test_a_new_file_elsewhere_in_the_pr_does_not_disqualify_the_case(self):
+        """加了个测试文件不该让整条样本作废。
+
+        重放 977 个已缓存 diff 量出来的：unsupported-diff 占 37.5%，
+        其中 new file mode 占 91.8% —— 约三分之一候选是这么丢的。
+        而新增的那个文件（测试/changelog/新模块）本来就会被 code_chunks
+        筛掉，不进待审 diff，为它丢掉整条样本是纯损失。
+        """
+        mixed = (
+            "diff --git a/pkg/digest.py b/pkg/digest.py\n"
+            "--- a/pkg/digest.py\n+++ b/pkg/digest.py\n"
+            "@@ -3,3 +3,3 @@ def token(data):\n"
+            "-    digest = hashlib.md5(data).hexdigest()\n"
+            "+    digest = hashlib.sha256(data).hexdigest()\n"
+            "     return digest\n"
+            "diff --git a/tests/test_digest.py b/tests/test_digest.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n+++ b/tests/test_digest.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+def test_token():\n"
+            "+    assert token(b'x')\n"
+        )
+        case = build_case(_pull(mixed, title="Fix weak digest for tokens"),
+                          "validation", "2024-07-01")
+        # 待审 diff 里只剩生产文件，新增的测试文件没被带进来
+        self.assertIn("pkg/digest.py", case["diff"])
+        self.assertNotIn("tests/test_digest.py", case["diff"])
+        self.assertNotIn("new file mode", case["diff"])
+
+    def test_an_unsupported_marker_in_a_used_block_is_still_rejected(self):
+        """逐块判不等于放开：标记落在要用的块里照样拒。
+
+        新增文件的 a/ 侧不存在，反转后要生成"删掉整个文件"的 diff，
+        待审 diff 里出现删文件会让缺陷定位失去意义。
+        """
+        added_prod = (
+            "diff --git a/pkg/brand_new.py b/pkg/brand_new.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n+++ b/pkg/brand_new.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+def handler():\n"
+            "+    return None\n"
+        )
+        with self.assertRaises(CaseRejected) as ctx:
+            build_case(_pull(added_prod, title="Fix missing handler"),
+                       "validation", "2024-07-01")
+        self.assertEqual("unsupported-diff", ctx.exception.reason)
+
+    def test_size_limits_count_the_review_diff_not_the_whole_pr(self):
+        """规模上限按筛完之后的块算。
+
+        阈值本身没动（3 个文件 / 20 行）；改的是分母——测试文件不进
+        待审 diff，就不该占额度。这条锁住的是口径，不是宽松度。
+        """
+        # 生产文件只改 2 行、1 个文件；测试文件很大，加起来会超两条上限
+        big_tests = "".join(
+            "+    assert step_%d()\n" % i for i in range(30)
+        )
+        mixed = (
+            "diff --git a/pkg/digest.py b/pkg/digest.py\n"
+            "--- a/pkg/digest.py\n+++ b/pkg/digest.py\n"
+            "@@ -3,3 +3,3 @@ def token(data):\n"
+            "-    digest = hashlib.md5(data).hexdigest()\n"
+            "+    digest = hashlib.sha256(data).hexdigest()\n"
+            "     return digest\n"
+            "diff --git a/tests/test_a.py b/tests/test_a.py\n"
+            "--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+            "@@ -1,0 +1,30 @@\n" + big_tests +
+            "diff --git a/tests/test_b.py b/tests/test_b.py\n"
+            "--- a/tests/test_b.py\n+++ b/tests/test_b.py\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+def test_b():\n"
+            "+    assert True\n"
+            "diff --git a/tests/test_c.py b/tests/test_c.py\n"
+            "--- a/tests/test_c.py\n+++ b/tests/test_c.py\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+def test_c():\n"
+            "+    assert True\n"
+        )
+        # 整份 diff：4 个文件（> 3）、30+ 行（> 20）——旧口径会双重拒收
+        case = build_case(_pull(mixed, title="Fix weak digest for tokens"),
+                          "validation", "2024-07-01")
+        self.assertEqual(1, case["diff"].count("diff --git"))
+        self.assertLessEqual(count_changed_lines(case["diff"]), MAX_FIX_LINES)
+
+    def test_too_many_production_files_is_still_rejected(self):
+        """把分母改成 code_chunks 之后，这条上限仍然要挡得住。
+
+        补这条是因为变异测试暴露了一个空白：把 MAX_FIX_FILES 从 3 放到 30
+        时整个测试文件仍然全绿——说明没有任何测试真的走到"生产文件太多"
+        这条路上（原有的用例都是测试文件超额，不是生产文件超额）。
+        """
+        many = "".join(
+            "diff --git a/pkg/m%d.py b/pkg/m%d.py\n"
+            "--- a/pkg/m%d.py\n+++ b/pkg/m%d.py\n"
+            "@@ -1,2 +1,2 @@\n-x = %d\n+x = %d\n" % (i, i, i, i, i, i + 1)
+            for i in range(4)
+        )
+        with self.assertRaises(CaseRejected) as ctx:
+            build_case(_pull(many, title="Fix wrong constants"),
+                       "validation", "2024-07-01")
+        self.assertEqual("too-many-files", ctx.exception.reason)
 
     def test_a_comment_only_fix_is_stopped_by_content_not_by_title(self):
         """放宽 comment 之后留了一个口子，这条钉住兜它的是哪一层。

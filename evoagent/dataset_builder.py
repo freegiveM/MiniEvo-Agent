@@ -639,19 +639,10 @@ def build_case(
     diff = pull.diff or ""
     if not diff.strip():
         raise CaseRejected("empty-diff")
-    for marker in UNSUPPORTED_MARKERS:
-        if marker in diff:
-            raise CaseRejected("unsupported-diff", marker.strip())
-    if NO_NEWLINE in diff:
-        raise CaseRejected("unsupported-diff", "no-newline-marker")
 
     chunks = split_diff_by_file(diff)
     if not chunks:
         raise CaseRejected("unparsable-diff")
-    if len(chunks) > MAX_FIX_FILES:
-        raise CaseRejected("too-many-files", str(len(chunks)))
-    if count_changed_lines(diff) > MAX_FIX_LINES:
-        raise CaseRejected("too-many-lines", str(count_changed_lines(diff)))
 
     # 只保留非测试 .py 的文件块。测试文件的改动反转后不是缺陷；
     # 把它们留在待审 diff 里会让 agent 有机会从测试内容反推答案。
@@ -659,6 +650,51 @@ def build_case(
         (path, text) for path, text in chunks
         if path.endswith(".py") and not is_test_path(path)
     ]
+
+    # 不可反转标记的检查放在**筛完文件块之后**，而且逐块判。
+    #
+    # 原来是整份 diff 里出现标记就拒掉整个 PR。第一批数据（90 条）跑完
+    # 用 977 个已缓存 diff 重放，量出这条是最大的损失来源：
+    #
+    #   unsupported-diff  366/977 (37.5%)，其中 new file mode 占 336 (91.8%)
+    #
+    # 也就是**约三分之一的候选**是因为"PR 里新增了某个文件"被整条丢掉的。
+    # 但新增的那个文件通常是测试、changelog 或新模块——而这些块在上面
+    # 已经被 code_chunks 筛掉了，本来就不会进入反转。为一个不会被用到的
+    # 文件丢掉整条样本，是纯损失。
+    #
+    # 顺带纠正一个我一开始的误判：我以为类别塌成 91% logic-boundary 是
+    # fix-adds-only（纯新增修复反转不了）造成的。重放数据否掉了这个说法
+    # ——fix-adds-only 只占 2.3%。构造方法排除 missing-check 类这条边界
+    # 是真的（模块 docstring 里写着），但它不是这批数据塌掉的原因。
+    #
+    # 为什么仍然逐块拒而不是全放开：反转 new file mode 的块是真的不可靠
+    # （新增文件的 a/ 侧不存在，反转后要生成"删除整个文件"的 diff，
+    # 而待审 diff 里出现删文件会让缺陷定位失去意义）。所以标记落在
+    # **要用的块**里时照样拒，只是不再连累其他块。
+    used = "".join(text for _path, text in code_chunks)
+    for marker in UNSUPPORTED_MARKERS:
+        if marker in used:
+            raise CaseRejected("unsupported-diff", marker.strip())
+    if NO_NEWLINE in used:
+        raise CaseRejected("unsupported-diff", "no-newline-marker")
+
+    # 规模上限也按**筛完之后的块**算，不按整份 diff 算。
+    #
+    # 这两条原来在筛选之前，量的是"这个 PR 一共动了多少"；但真正决定
+    # 标注可靠性的是"待审 diff 有多大"——测试文件和 changelog 不进待审
+    # diff，不该占额度。把标记检查改成逐块之后这点变得很明显：
+    # too-many-files 从 130 涨到 343，涨的全是"改 1 个 py + 加 1 个测试"
+    # 这种本来合格的 PR。
+    #
+    # **阈值本身一个都没动**（MAX_FIX_FILES=3、MAX_FIX_LINES=20）。
+    # 改的是分母口径，不是把关口放松——这两件事在数据集构造里必须分清：
+    # 放宽阈值会让待审 diff 变大、种子缺陷定位变糊、指标虚高；
+    # 修正分母只是不再把不参与评测的文件算进来。
+    if len(code_chunks) > MAX_FIX_FILES:
+        raise CaseRejected("too-many-files", str(len(code_chunks)))
+    if count_changed_lines(used) > MAX_FIX_LINES:
+        raise CaseRejected("too-many-lines", str(count_changed_lines(used)))
     if not code_chunks:
         raise CaseRejected("no-production-python")
 
