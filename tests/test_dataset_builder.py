@@ -415,6 +415,70 @@ class BuildCaseTests(unittest.TestCase):
                        "validation", "2024-07-01")
         self.assertEqual("too-many-files", ctx.exception.reason)
 
+    def test_release_commits_are_rejected_by_title(self):
+        """发版提交是最坏的一种脏样本。
+
+        抽查 60 条兜底样本时发现的，4/95 属于这种。它们能过筛是因为
+        FIX_KEYWORDS 同时看标题和正文，而发版 PR 的正文是 changelog，
+        必然含 "fix"。
+
+        反转之后"缺陷代码"是一行 __version__ = "0.28.0"：报它算误报，
+        不报算漏报，无论如何都在给指标注噪声，而且方向不定。
+        """
+        for title in ("Version 0.28.1", "v2.34.1", "2.34.1", "Version 0.27.0"):
+            with self.assertRaises(CaseRejected) as ctx:
+                build_case(_pull(CRYPTO_FIX, title=title, body="changelog: fix a bug"),
+                           "validation", "2024-07-01")
+            self.assertEqual("release-commit", ctx.exception.reason, title)
+
+    def test_a_fix_that_merely_mentions_a_version_is_kept(self):
+        """只认标题**整体**是版本号。含版本号的真缺陷必须留下。"""
+        for title in ("Fix crash in 2.34 release path",
+                      "Fix version comparison off-by-one"):
+            case = build_case(_pull(CRYPTO_FIX, title=title),
+                              "validation", "2024-07-01")
+            self.assertEqual(title, case["fix_pr_title"])
+
+    def test_a_release_commit_with_a_prose_title_is_caught_by_its_seed_lines(self):
+        """标题层挡不住 "Prepare 2.34.1" 这种，要靠内容层兜。
+
+        条件是**全部**种子行都是版本号赋值。真缺陷顺带碰一行版本号的
+        情况要留下 —— 见下一条。
+        """
+        version_only = (
+            "diff --git a/pkg/__init__.py b/pkg/__init__.py\n"
+            "--- a/pkg/__init__.py\n+++ b/pkg/__init__.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            '-__version__ = "2.34.1"\n'
+            '+__version__ = "2.34.0"\n'
+            " x = 1\n"
+        )
+        # 标题要带 fix 词才能走到内容层 —— "Prepare 2.34.1 release" 会先被
+        # not-a-bugfix 拦掉（实测确认过）。内容层兜的是那些**看起来像修复**
+        # 的发版 PR，那才是会漏进数据集的形态。
+        with self.assertRaises(CaseRejected) as ctx:
+            build_case(_pull(version_only, title="Fix release metadata for 2.34.1"),
+                       "validation", "2024-07-01")
+        self.assertEqual("release-commit", ctx.exception.reason)
+
+    def test_a_real_fix_that_also_touches_a_version_line_is_kept(self):
+        """"全部种子行都是版本号"才拒。这条锁住那个"全部"。"""
+        # 这是**真实修复**的方向：把 md5 换成 sha256，同时顺手改了版本号。
+        # 反转之后种子行是 md5 那一行 + 版本号那一行，不全是版本号，要留下。
+        mixed = (
+            "diff --git a/pkg/digest.py b/pkg/digest.py\n"
+            "--- a/pkg/digest.py\n+++ b/pkg/digest.py\n"
+            "@@ -1,4 +1,4 @@\n"
+            '-__version__ = "2.0.0"\n'
+            '+__version__ = "2.1.0"\n'
+            "-    digest = hashlib.md5(data).hexdigest()\n"
+            "+    digest = hashlib.sha256(data).hexdigest()\n"
+            " return digest\n"
+        )
+        case = build_case(_pull(mixed, title="Fix weak digest for tokens"),
+                          "validation", "2024-07-01")
+        self.assertEqual("crypto-weak", case["defect_class"])
+
     def test_a_comment_only_fix_is_stopped_by_content_not_by_title(self):
         """放宽 comment 之后留了一个口子，这条钉住兜它的是哪一层。
 

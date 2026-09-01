@@ -111,6 +111,32 @@ EXCLUDE_KEYWORDS = re.compile(
     r"test only|add tests?|more tests?)\b"
 )
 
+# 发版提交：标题就是一个版本号。
+#
+# 抽查 60 条兜底样本时发现的，4/95 属于这种（httpx 三条、requests 一条）。
+# 它们能过筛是因为 FIX_KEYWORDS 同时看标题**和正文**，而发版 PR 的正文是
+# changelog，里面必然有 "fix" 字样。标题层拦不住，正文层反而帮了倒忙。
+#
+# 这是最坏的一种脏样本：反转之后"缺陷代码"是一行 __version__ = "0.28.0"。
+# 任何审查器报它都算误报，不报又算漏报——这条样本无论如何都在给指标注噪声，
+# 而且方向不定。相比之下"类别判不出来"只是信息不足，还能用。
+#
+# 只认标题**整体**是版本号，不认标题里含版本号：
+# "Fix crash in 2.34 release path" 是真缺陷，必须放行。
+RELEASE_TITLE = re.compile(
+    r"(?i)^\s*(v(ersion)?\s*)?\d+\.\d+(\.\d+)?([-.\w]*)?\s*$"
+)
+
+# 版本号赋值行。用于在**内容层**再兜一次发版提交（标题可能是
+# "Prepare 2.34.1" 这种，过得了 RELEASE_TITLE）。
+VERSION_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    ^\s*
+    (__version__|__build__|VERSION|version|release|__release__)
+    \s*(:\s*\w+\s*)?=          # 允许 version: str = "..."
+    """
+)
+
 # upgrade 只在依赖升级的搭配里才算排除项。裸 "upgrade"（HTTP Upgrade 头、
 # protocol upgrade）放行。
 DEPENDENCY_UPGRADE = re.compile(
@@ -640,6 +666,10 @@ def screen_title(title: str, body: str) -> Optional[str]:
     # 这两条与上面同类（都是"这个 PR 不是 bugfix"），但需要上下文条件，
     # 理由见 EXCLUDE_KEYWORDS 上方的注释。归到同一个淘汰原因下，
     # 因为对漏斗统计来说它们就是一类。
+    if RELEASE_TITLE.match(title or ""):
+        # 单独一个原因，不并进 excluded-keyword：漏斗里要能看出发版提交
+        # 有多少。并进去就分不清"关键词拦掉的"和"发版拦掉的"了。
+        return "release-commit"
     if DEPENDENCY_UPGRADE.search(title or ""):
         return "excluded-keyword"
     if SUBJECT_ONLY_PREFIX.search(title or ""):
@@ -748,6 +778,16 @@ def build_case(
     ]
     if not seed_lines:
         raise CaseRejected("seed-lines-blank-or-comment-only")
+
+    # 内容层再兜一次发版提交。标题层只挡住"标题就是版本号"那种；
+    # "Prepare 2.34.1"、"Release candidate" 这类标题过得去，但种子行
+    # 仍然全是版本号赋值——那种样本的"缺陷"是一行 __version__ = "..."，
+    # 报它算误报、不报算漏报，无论如何都在注噪声。
+    #
+    # 条件是**全部**种子行都是版本号赋值，不是"含有"。真缺陷的修复里
+    # 可能顺带碰一行版本号，那种要留下。
+    if all(VERSION_ASSIGNMENT.match(line) for line in seed_lines):
+        raise CaseRejected("release-commit", "seed lines are only version bumps")
 
     defect, class_basis = classify_defect_with_basis(seed_lines, title)
     findings = _seed_findings(reverted, defect)
