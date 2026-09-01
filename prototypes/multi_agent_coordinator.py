@@ -1,5 +1,11 @@
 """Multi-agent review with planning, dialogue, verification and arbitration.
 
+**原型，不在评测链路上（见 prototypes/__init__.py）。**
+所有报出来的数字都来自 evoagent/agentic_core.py 的四角色实现，不是这里。
+这套协作协议（CollaborationBus + 同侪质询 + 仲裁）实现是完整的、测试是
+绿的，但从没被评测经过，所以它的效果没有任何量化结论。
+要引用"多智能体协作带来多少提升"，只能引 agentic_core 那一套。
+
 The coordinator implements a bounded collaboration protocol:
 plan -> specialist review -> peer challenge -> evidence revision -> independent
 verification -> arbitration.  Every hand-off is persisted as an agent message
@@ -12,12 +18,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, TypedDict
 
-from .context_manager import ContextManager
-from .diff_parser import ParsedDiff
-from .memory import MemoryManager
-from .models import Finding, Severity
-from .reviewer import LocalRuleReviewer, Reviewer
-from .runtime import AgentLoop, AgentRuntime, AgentTool, RuntimeNode, ToolRegistry
+from evoagent.context_manager import ContextManager
+from evoagent.diff_parser import ParsedDiff
+from evoagent.memory import MemoryManager
+from evoagent.models import Finding, Severity
+from evoagent.reviewer import LocalRuleReviewer, Reviewer
+from evoagent.runtime import AgentLoop, AgentRuntime, AgentTool, RuntimeNode, ToolRegistry
 
 
 @dataclass

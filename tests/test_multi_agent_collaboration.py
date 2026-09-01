@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from evoagent.agents import MultiAgentCoordinator
+from prototypes.multi_agent_coordinator import MultiAgentCoordinator
 from evoagent.diff_parser import parse_unified_diff
 from evoagent.models import Finding, Severity
 from evoagent.reviewer import ReliabilityRuleReviewer, SecurityRuleReviewer

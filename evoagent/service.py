@@ -2,7 +2,7 @@ import hashlib
 import uuid
 from typing import Any, Dict, Optional
 
-from .agents import MultiAgentCoordinator
+from prototypes.multi_agent_coordinator import MultiAgentCoordinator
 from .agentic_core import ModeRouterReviewer
 from .auth import AuthManager
 from .config import Settings
