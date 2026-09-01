@@ -63,13 +63,91 @@ LINKED_ISSUE = re.compile(r"(?i)(fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+#\d+")
 
 # 排除类关键词：这些 PR 的"删除行"不是缺陷，反转后会产生假标注。
 # revert 尤其危险——反转一个 revert 等于恢复原始正确代码，标注完全错误。
+#
+# ── 关于 upgrade / docs 的两个例外（pilot 实测后加的）────────────────────
+#
+# 首轮 pilot 之后，我拿三个仓库约 600 个已合并 PR 量了这张表的误杀率：
+# 16 条标题同时含 fix 类词又被 EXCLUDE 淘汰，其中 14 条杀对了
+# （typo、broken link、lint），2 条是真损失，而且**坏在同一个地方**：
+#
+#   "Fix pipelining a rejected upgrade"          ← upgrade 是 HTTP Upgrade 头
+#   "websocket_ping: fix ping interval ... and improve docs"  ← docs 在尾巴上
+#
+# 两条都是"这个词在这里不是它在依赖升级/文档 PR 里的那个意思"。
+# 前者恰好是 L3/L4 协议边界样本——采样计划里最难凑够的那一类。
+#
+# 权衡过三种改法：
+#   1. 删掉 upgrade / docs：会放进大量真的依赖升级和文档 PR，误标注率上升。
+#      淘汰规则的代价是不对称的——漏掉一个样本只是少一条，
+#      放进一个假标注会污染指标，所以不能往松的方向一刀切。
+#   2. 改成看 diff 内容判定（比如只碰 .md 就算文档）：更准，但要花请求，
+#      而 screen_title 存在的全部意义就是**在花请求之前**淘汰。
+#   3. 只收紧这两个词的匹配条件，其余 22 个词不动。← 选这条
+#
+# 具体收紧方式也不同，因为两条的失败机制不同：
+#   upgrade → 只在依赖升级的惯用搭配里才算（upgrade + 版本号/包名/to X.Y），
+#             裸 upgrade 放行，让后面的 no-production-python / diff 规则接管。
+#   docs   → 只在**开头**出现才算（"docs: ..." 是压倒性的文档 PR 惯例），
+#             出现在句中不算。这条不会放进 "docs: fix typo"，
+#             因为 typo 仍在表里、仍会被杀。
+#
+# 收紧 docs 之后又暴露出同一个毛病的另外两个词（这次是我自己测出来的，
+# 不在那 16 条里，因为那三个仓库刚好没有这种标题）：
+#
+#   "Fix race condition in connector cleanup"   ← cleanup 是被修的对象
+#   "Fix incorrect comment handling in parser"  ← comment 是被解析的对象
+#
+# 这两条分别属于 L4 并发/资源生命周期和 logic-boundary，也都是稀缺类。
+# 处理方式和 docs 一致：只在标题**开头**（= 这个 PR 的主题）才算排除项。
+# "cleanup: remove dead code" 仍会被杀，"fix ... cleanup" 会放行。
+#
+# 没有把这两条写进 EXCLUDE 主表，是因为主表是"词出现即淘汰"的简单语义，
+# 混进带上下文条件的项会让它变得难读且容易误改。
 EXCLUDE_KEYWORDS = re.compile(
-    r"(?i)\b(revert|reverts|reverting|refactor\w*|rename\w*|cleanup|clean up|"
-    r"typo|format\w*|lint\w*|style|black|isort|flake8|"
-    r"bump|upgrade|downgrade|dependabot|pre-commit|"
-    r"changelog|docs?|documentation|comment|whitespace|deprecat\w*|"
+    r"(?i)\b(revert|reverts|reverting|refactor\w*|rename\w*|clean up|"
+    r"typo|format\w*|lint\w*|black|isort|flake8|"
+    r"bump|downgrade|dependabot|pre-commit|"
+    r"changelog|documentation|whitespace|deprecat\w*|"
     r"test only|add tests?|more tests?)\b"
 )
+
+# upgrade 只在依赖升级的搭配里才算排除项。裸 "upgrade"（HTTP Upgrade 头、
+# protocol upgrade）放行。
+DEPENDENCY_UPGRADE = re.compile(
+    r"(?i)\b(upgrade|upgrading)\b.{0,30}?"
+    r"(\bto\b\s*v?\d|\bv?\d+\.\d+|\bdeps?\b|\bdependenc\w+|\brequirements?\b)"
+)
+
+# 这些词做 PR 主题时是排除项，做句中普通名词时不是。只认标题开头
+# （"docs: ..." / "cleanup(x): ..." / "style - ..." 这类惯例写法）。
+SUBJECT_ONLY_PREFIX = re.compile(
+    r"(?i)^\s*(docs?|cleanup|comments?|style|styles)\b\s*[:(\[/-]"
+)
+
+# 放宽 comment 之后剩下的一个漏网口子，单独记一下，因为它划出了
+# 只看标题这条路的**能力边界**：
+#
+#   "web: Fix an incomplete comment that was omitted"  ← 真文档 PR，会漏进来
+#   "Fix incorrect comment handling in parser"          ← 真缺陷，要放行
+#
+# 两者的差别在 "comment" 是被修的**内容**还是被处理的**对象**，
+# 标题里没有任何可靠信号能分开——"web:" 前缀让主题式判定也失效了。
+#
+# 选择是**不再收紧**，让前者漏进来。理由是这一层不是最后一道关，而且
+# 下游那道关是**按内容判的，不是按文件名判的**（这点我核过代码才敢写）：
+#
+#   fix-adds-only / seed-lines-blank-or-comment-only 这两条在挑删除行和
+#   种子行时都跳过 "#" 开头的行。纯改注释的 PR 反转后没有任何非注释新增行，
+#   一定会被它们拒掉——即使它改的是 .py 文件、过得了 no-production-python。
+#   （no-production-python 只管"有没有碰非测试 .py"，管不了"碰的是不是注释"。）
+#
+# 而如果为了堵它把 comment 放回"词出现即淘汰"，代价是稳定杀掉整类
+# parser 缺陷样本。
+#
+# 判据仍是筛选规则的代价不对称：假接受会注入一条错标注、污染指标；
+# 假拒绝只少一条样本。但这里的假接受**下游有按内容判的规则接管**，
+# 假拒绝没人管——所以宁可放过去。代价只是多花一次 diff 请求。
+DOC_ONLY_HINT = None  # 占位说明：刻意不加这条规则，理由见上。
 
 
 # ── 二、缺陷分类（八类 → CWE → severity）────────────────────────────────
@@ -529,6 +607,13 @@ def screen_title(title: str, body: str) -> Optional[str]:
         # 顺序反了会先被判成合格 bugfix。
         return "backport-duplicate"
     if EXCLUDE_KEYWORDS.search(title or ""):
+        return "excluded-keyword"
+    # 这两条与上面同类（都是"这个 PR 不是 bugfix"），但需要上下文条件，
+    # 理由见 EXCLUDE_KEYWORDS 上方的注释。归到同一个淘汰原因下，
+    # 因为对漏斗统计来说它们就是一类。
+    if DEPENDENCY_UPGRADE.search(title or ""):
+        return "excluded-keyword"
+    if SUBJECT_ONLY_PREFIX.search(title or ""):
         return "excluded-keyword"
     if not FIX_KEYWORDS.search("%s\n%s" % (title or "", body or "")):
         return "not-a-bugfix"

@@ -221,6 +221,72 @@ class BuildCaseTests(unittest.TestCase):
             with self.assertRaises(CaseRejected):
                 build_case(_pull(CRYPTO_FIX, title=title), "validation", "2024-07-01")
 
+    def test_a_word_that_is_ordinary_vocabulary_mid_sentence_is_not_a_kill(self):
+        """这几条标题是 pilot 实测被误杀的真样本，必须放行。
+
+        全都坏在同一处：upgrade / docs / cleanup / comment / style 做
+        依赖动作或 PR 主题时该杀，做句中普通名词时不该杀。而被误杀的
+        恰好集中在 L3/L4 协议边界、并发/资源生命周期、parser 边界
+        ——采样计划里最难凑够的三类。
+
+        用 CRYPTO_FIX 的 diff 只是为了让 build_case 能跑完；
+        这里断言的是标题判定，不是分类结果。
+        """
+        for title in (
+            "Fix pipelining a rejected upgrade",
+            "websocket_ping: fix ping interval with non-zero timeout and improve docs",
+            "Fix race condition in connector cleanup",
+            "fix resource cleanup on cancel",
+            "Fix incorrect comment handling in parser",
+            "fix crash in style attribute parsing",
+        ):
+            case = build_case(_pull(CRYPTO_FIX, title=title),
+                              "validation", "2024-07-01")
+            self.assertEqual(title, case["fix_pr_title"])
+
+    def test_the_same_words_as_a_pr_subject_are_still_rejected(self):
+        """放宽不能把主题式写法一起放进来，否则等于删掉了这几个词。"""
+        for title in (
+            "docs: fix typos in comments and documentation",
+            "docs(api): rewrite the intro",
+            "cleanup: remove dead code",
+            "comment: clarify why we retry",
+            "style: reformat with black",
+            "Upgrade requests to 2.31.0",
+            "upgrade deps for security",
+        ):
+            with self.assertRaises(CaseRejected) as ctx:
+                build_case(_pull(CRYPTO_FIX, title=title),
+                           "validation", "2024-07-01")
+            self.assertEqual("excluded-keyword", ctx.exception.reason, title)
+
+    def test_a_comment_only_fix_is_stopped_by_content_not_by_title(self):
+        """放宽 comment 之后留了一个口子，这条钉住兜它的是哪一层。
+
+        `web: Fix an incomplete comment...` 这种真文档 PR 现在过得了标题层
+        （主题前缀是 web:，不是 comment:）。刻意不再收紧标题规则，因为
+        收紧的代价是杀掉整类 parser 缺陷样本。
+
+        兜它的是 fix-adds-only —— 挑删除行时跳过 "#" 开头的行，所以纯改
+        注释的 PR 反转后没有非注释新增行。注意**不是** no-production-python：
+        那条只管"有没有碰非测试 .py"，这个 diff 碰的正是 .py。
+        """
+        comment_only = (
+            "diff --git a/pkg/parser.py b/pkg/parser.py\n"
+            "--- a/pkg/parser.py\n+++ b/pkg/parser.py\n"
+            "@@ -10,3 +10,3 @@\n"
+            "-# incomplete comment\n"
+            "+# complete and accurate comment\n"
+            " value = 1\n"
+        )
+        with self.assertRaises(CaseRejected) as ctx:
+            build_case(
+                _pull(comment_only,
+                      title="web: Fix an incomplete comment that was omitted"),
+                "validation", "2024-07-01",
+            )
+        self.assertEqual("fix-adds-only", ctx.exception.reason)
+
     def test_feature_prs_without_a_fix_keyword_are_rejected(self):
         with self.assertRaises(CaseRejected) as ctx:
             build_case(
