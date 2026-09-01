@@ -274,15 +274,44 @@ def classify_defect(seed_lines: Sequence[str], title: str = "") -> DefectClass:
     先按代码特征判，代码判不出来再看标题。反过来会更差：标题里的
     "fix race condition" 常常描述的是症状而非这几行代码本身的形态。
     """
+    return classify_defect_with_basis(seed_lines, title)[0]
+
+
+def classify_defect_with_basis(
+    seed_lines: Sequence[str], title: str = "",
+) -> "tuple":
+    """同 classify_defect，但**同时返回这个标签是怎么来的**。
+
+    为什么需要这个：第三批数据（95 条）报出 logic-boundary 占 90.5%，
+    我一开始当成采样问题去修（先修了误杀词，又修了分母口径，通过率从
+    9.5% 提到 34.2%），但这一类的占比几乎没动。量了才知道原因不在采样：
+
+      代码特征命中        33 (34.7%)
+      靠标题词             2 ( 2.1%)
+      都没命中 -> 兜底     60 (63.2%)   ← 全部落进 logic-boundary
+
+    也就是说 logic-boundary 这 86 条里，只有 26 条是**判定**为边界缺陷，
+    60 条是"八类特征一个都没匹配上"的默认值。这两件事在报告里写成同一个
+    数字，等于宣称"这批数据以边界缺陷为主"——而真实情况是"这批数据的
+    类别大部分判不出来"。前者是结论，后者是承认无能，不能混。
+
+    兜底本身不改（改成 unknown 会让 expected_findings 少一个 CWE，
+    下游命中判定要跟着改，代价大且不解决根因）。改的是**留痕**：
+    把依据一并返回，让报告能把"判出来的"和"兜底的"分开报。
+
+    与 label_provenance 的区别：那个记的是"凭什么认定这是 bugfix"，
+    这个记的是"凭什么认定它属于这一类"。两个都会错，但错法不同，
+    混在一个字段里就没法分别追。
+    """
     blob = "\n".join(seed_lines)
     for item in DEFECT_CLASSES:
         if any(pattern.search(blob) for pattern in item.patterns):
-            return item
+            return item, "code-pattern"
     lowered = title.lower()
     for item in DEFECT_CLASSES:
         if item.name.split("-")[0] in lowered:
-            return item
-    return _CLASS_BY_NAME["logic-boundary"]
+            return item, "title-word"
+    return _CLASS_BY_NAME["logic-boundary"], "fallback-default"
 
 
 # ── 三、难度分级 ────────────────────────────────────────────────────────
@@ -720,7 +749,7 @@ def build_case(
     if not seed_lines:
         raise CaseRejected("seed-lines-blank-or-comment-only")
 
-    defect = classify_defect(seed_lines, title)
+    defect, class_basis = classify_defect_with_basis(seed_lines, title)
     findings = _seed_findings(reverted, defect)
     if not findings:
         raise CaseRejected("no-seed-findings")
@@ -746,6 +775,10 @@ def build_case(
         "contamination_split": contamination_split(pull.merged_at, cutoff),
         "difficulty": difficulty,
         "defect_class": defect.name,
+        # 这个标签是判出来的还是兜底的。fallback-default 的样本，其
+        # defect_class 只表示"八类特征都没匹配上"，不表示判定为该类。
+        # 报告必须把两者分开，否则 logic-boundary 的占比会被读成结论。
+        "defect_class_basis": class_basis,
         "rule_covered": defect.rule_covered,
         "domain": domain,
         "label_provenance": label_provenance(title, body),
@@ -779,6 +812,7 @@ class CoverageReport:
     by_contamination: Dict[str, int] = field(default_factory=dict)
     by_repository: Dict[str, int] = field(default_factory=dict)
     by_provenance: Dict[str, int] = field(default_factory=dict)
+    by_class_basis: Dict[str, int] = field(default_factory=dict)
     rejections: Dict[str, int] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -786,6 +820,15 @@ class CoverageReport:
 TARGET_DIFFICULTY_SHARE = {"L1": 0.25, "L2": 0.35, "L3": 0.25, "L4": 0.15}
 MIN_PER_CLASS = 6
 MIN_PER_CONTAMINATION = 15
+
+# 兜底类别占比的告警线。超过这条说明"类别分布"这个说法本身不成立：
+# 报出来的多数标签只是默认值，不是判定结果。
+#
+# 取 0.4 的理由：低于这个比例时，主类里判出来的样本仍占多数，分布还能
+# 当参考；超过之后，最大的那一类主要由"没匹配上"构成，再谈"以某类为主"
+# 就是在把无能读成结论。这个数没有文献依据，是我按"主类是否仍以判定
+# 为主"定的，写在这里以便后面有数据了可以改。
+MAX_FALLBACK_SHARE = 0.4
 
 
 def summarise(cases: Iterable[dict], rejections: Optional[Dict[str, int]] = None) -> CoverageReport:
@@ -808,9 +851,28 @@ def summarise(cases: Iterable[dict], rejections: Optional[Dict[str, int]] = None
             ("contamination_split", report.by_contamination),
             ("repository", report.by_repository),
             ("label_provenance", report.by_provenance),
+            ("defect_class_basis", report.by_class_basis),
         ):
             value = str(case.get(key, "unknown"))
             bucket[value] = bucket.get(value, 0) + 1
+
+    # 兜底类别占比要单独告警，而且要放在类别不足的告警**之前**报。
+    #
+    # 顺序是刻意的：如果多数标签是兜底来的，那么"某类不足 6 条"这些告警
+    # 就是次要问题——先要知道的是"类别分布这件事本身有多大程度上不成立"。
+    # 反过来先报一堆类别不足，读者会以为要去补那几类，而真正该做的是
+    # 先修分类器或承认类别报不了。
+    fallback = report.by_class_basis.get("fallback-default", 0)
+    if report.total and fallback > report.total * MAX_FALLBACK_SHARE:
+        report.warnings.append(
+            "HARD CONSTRAINT VIOLATED: %d/%d (%.0f%%) of cases got their "
+            "defect_class from the fallback default, not from a match. The class "
+            "distribution below is therefore not a finding about these defects — "
+            "it mostly reports what the classifier could not identify. Do not "
+            "report per-class metrics until this is under %.0f%%."
+            % (fallback, report.total, 100.0 * fallback / report.total,
+               100.0 * MAX_FALLBACK_SHARE)
+        )
 
     for item in DEFECT_CLASSES:
         count = report.by_class.get(item.name, 0)

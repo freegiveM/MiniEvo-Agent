@@ -16,6 +16,7 @@ from evoagent.dataset_builder import (
     PullRequest,
     build_case,
     classify_defect,
+    classify_defect_with_basis,
     contamination_split,
     count_changed_lines,
     count_touched_functions,
@@ -123,6 +124,55 @@ class ClassificationTests(unittest.TestCase):
     def test_unremarkable_comparison_falls_back_to_logic_boundary(self):
         defect = classify_defect(["    if index > len(items):"])
         self.assertEqual("logic-boundary", defect.name)
+
+    def test_the_basis_distinguishes_a_judgement_from_a_default(self):
+        """同样返回 logic-boundary，来源不同，含义完全不同。
+
+        兜底样本的 defect_class 只表示"八类特征都没匹配上"。不留这个痕迹，
+        报告里"logic-boundary 90.5%"就会被读成一个关于数据的结论，
+        而它实际上是关于分类器的结论。
+        """
+        # 有字面特征 -> 判出来的
+        _defect, basis = classify_defect_with_basis(
+            ["    digest = hashlib.md5(data).hexdigest()"])
+        self.assertEqual("code-pattern", basis)
+
+        # 八类特征一个都没中、标题也没线索 -> 兜底
+        #
+        # 注意这里**不能**用 `if index > len(items):`：比较运算符是
+        # logic-boundary 自己的特征，那条会走 code-pattern 分支，
+        # 测不到兜底。要用一行连比较都没有的普通赋值。
+        defect, basis = classify_defect_with_basis(["    self.retries = retries"])
+        self.assertEqual("logic-boundary", defect.name)
+        self.assertEqual("fallback-default", basis)
+
+        # 无字面特征但标题点明了类别 -> 靠标题
+        _defect, basis = classify_defect_with_basis(
+            ["    self.value = other"], title="fix concurrency issue in worker")
+        self.assertEqual("title-word", basis)
+
+    def test_build_case_records_the_classification_basis(self):
+        """两种来源都要测。
+
+        只测 code-pattern 那一条的话，把字段写死成 "code-pattern" 也能通过
+        （变异实测确认过）——而写死正是这个字段最可能出的错，因为写死之后
+        兜底样本会伪装成判出来的，硬约束告警永远不触发。
+        """
+        judged = build_case(_pull(CRYPTO_FIX), "validation", "2024-07-01")
+        self.assertEqual("code-pattern", judged["defect_class_basis"])
+
+        # 一行既无字面特征也无比较运算符的普通赋值 -> 必须记成兜底
+        plain = (
+            "diff --git a/pkg/conf.py b/pkg/conf.py\n"
+            "--- a/pkg/conf.py\n+++ b/pkg/conf.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-        self.retries = retries\n"
+            "+        self.retries = default_retries\n"
+            " value = 1\n"
+        )
+        defaulted = build_case(_pull(plain, title="Fix wrong retry source"),
+                               "validation", "2024-07-01")
+        self.assertEqual("fallback-default", defaulted["defect_class_basis"])
 
     def test_four_classes_are_outside_the_deterministic_rule_set(self):
         """臂 A（rules-only）在这四类上的召回上限是 0——可事先算出，不靠实验。"""
@@ -528,6 +578,49 @@ class CoverageReportTests(unittest.TestCase):
     def test_thin_defect_classes_are_warned_about(self):
         report = summarise([self._case()])
         self.assertTrue(any("injection" in text for text in report.warnings))
+
+    def test_a_mostly_defaulted_class_distribution_is_a_hard_violation(self):
+        """兜底占多数时，类别分布不是结论，必须硬失败。
+
+        实测触发过这条：第三批 95 条里 60 条（63%）的 defect_class 是
+        兜底默认值，而报告把它们和 26 条判出来的合并成 "logic-boundary
+        90.5%"。那个数字会被读成"这批数据以边界缺陷为主"，
+        真相是"这批数据的类别大多判不出来"。
+        """
+        cases = [self._case(defect_class="logic-boundary",
+                            defect_class_basis="fallback-default")
+                 for _ in range(7)]
+        cases += [self._case(defect_class_basis="code-pattern") for _ in range(3)]
+        report = summarise(cases)
+        violation = [t for t in report.warnings if "HARD CONSTRAINT VIOLATED" in t]
+        self.assertTrue(violation)
+        self.assertIn("fallback default", violation[0])
+        self.assertIn("7/10", violation[0])
+
+    def test_a_mostly_judged_distribution_does_not_trigger_the_violation(self):
+        """判出来的占多数时不能报这条，否则告警失去区分力。"""
+        cases = [self._case(defect_class_basis="code-pattern") for _ in range(8)]
+        cases += [self._case(defect_class="logic-boundary",
+                             defect_class_basis="fallback-default")
+                  for _ in range(2)]
+        report = summarise(cases)
+        self.assertFalse([t for t in report.warnings
+                          if "fallback default" in t])
+
+    def test_the_fallback_warning_comes_before_the_thin_class_warnings(self):
+        """顺序有意义：先说"类别分布不成立"，再说"某类不足"。
+
+        反了的话读者会先去补那几个稀缺类，而真正该先做的是修分类器
+        或者承认类别报不了。
+        """
+        cases = [self._case(defect_class="logic-boundary",
+                            defect_class_basis="fallback-default")
+                 for _ in range(9)]
+        report = summarise(cases)
+        texts = report.warnings
+        hard = next(i for i, t in enumerate(texts) if "HARD CONSTRAINT" in t)
+        thin = next(i for i, t in enumerate(texts) if "has 0 cases" in t)
+        self.assertLess(hard, thin)
 
     def test_repository_overlap_across_splits_is_reported_as_a_hard_violation(self):
         report = summarise([

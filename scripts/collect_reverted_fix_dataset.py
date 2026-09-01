@@ -296,6 +296,9 @@ def print_report(cases: list, rejections: dict) -> bool:
         ("defect class", report.by_class),
         ("contamination", report.by_contamination),
         ("label provenance", report.by_provenance),
+        # 紧跟在 defect class 之后报：读者看完类别分布，下一眼就该看到
+        # 这个分布里有多少是判出来的、多少是兜底的。
+        ("defect class basis", report.by_class_basis),
     ):
         print("\n%s:" % title)
         for key in sorted(bucket):
