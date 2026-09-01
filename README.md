@@ -1,26 +1,57 @@
 # EvoAgent PR Reviewer
 
-- 审查统一 diff，输出结构化问题、修复建议和测试建议
-- GitHub `pull_request` webhook（`opened`、`reopened`、`synchronize`）
+下面按**证据等级**分组，而不是按功能分组。理由和 `prototypes/__init__.py`
+里写的是同一条：一份能力清单里最容易骗人的地方，不是某一句话假，而是
+**"跑过评测的"和"只写完了的"混在一起列**，读者没法区分。
+
+### 一、在评测链路上，有量化结论
+
+跑的是 `evaluation_v2.py` → `agentic_core.ModeRouterReviewer`，指标见
+`docs/` 下的评测报告：
+
+- 审查统一 diff，输出结构化问题、修复建议与测试建议
 - 三种如实披露的运行模式：`rules-only`、`hybrid`、`agentic`
-- SQLite 保存任务状态、执行轨迹和最终报告
-- JSON API 与 Markdown 报告
-- webhook HMAC-SHA256 签名校验，以及可选的 GitHub PR 评论回写
-- Web 管理台、任务 Dashboard 与 Prometheus 指标
-- Agentic 模式只包含四个真实 LLM 角色：Planner、Security、Correctness/Reliability、Critic
-- LLM unified patch、AST/CST、沙箱前后测试对比与仅 Draft PR 的修复闭环
-- PostgreSQL、Redis 生产模式
+- Agentic 模式四个 LLM 角色：Planner、Security、Correctness/Reliability、Critic
+- 有界 Agent Loop：Tool Registry、参数 Schema 校验、结构化 Observation，
+  以及 token/时间/步数三重预算（超预算记 `budget_exhausted` 后中止）
+- 按 task graph 给 specialist 分派文件范围，**在工具层**拒绝越界读取并记账
+- 证据门禁：把"缺哪类证据"回灌给 critic，与门禁判决保持两道独立过滤
 - 失败案例回流、提示词评测、版本激活与回滚
-- 自研 Agent Runtime、持久化 checkpoint、执行预算与任务断点续跑
-- 带 Tool Registry、参数 Schema 校验和结构化 Observation 的有界 Agent Loop
-- 覆盖任务、工具、反馈、记忆、观察与 Diff 的统一 Context Window 和逐轮压缩
+- SQLite 保存任务状态、执行轨迹与最终报告
+
+修复闭环（LLM unified patch、AST/CST、隔离工作副本内的前后测试对比、
+只开 Draft PR）也在这条链路上，但**基准集里 8 条修复只有 1 条标了
+`auto_fixable`，所以这一段实际被跑到的次数很少**，不算量过。
+
+### 二、实现完整、有单测，但不在评测链路上
+
+这些代码只经过 `service.py`，`agentic_core` 里一次都没出现过，
+所以简历上不能拿它们当"验证过的设计"：
+
+- 覆盖任务/工具/反馈/记忆/观察/Diff 的统一 Context Window 与逐轮压缩
+  （`context_manager.py`；评测链路走的是 `BoundedRole` 的硬预算截断，不压缩）
 - Working/Episodic/Semantic 分层记忆、租户级检索、任务归档与过期清理
-- Redis Streams ACK、Worker 租约、指数退避重试和死信队列
+- GitHub `pull_request` webhook、HMAC-SHA256 签名校验、PR 评论回写
 - Webhook delivery 幂等、重放时间窗与评论 upsert
-- 用户登录、RBAC、租户/仓库隔离和不可变管理审计
-- 动态 Skill manifest 校验、签名校验和隔离进程沙箱
-- 自动修复后的编译/测试门禁、灰度发布与影子流量
-- OpenTelemetry Trace、Prometheus 指标和持久化告警
+- 用户登录、RBAC、租户/仓库隔离与不可变管理审计
+- 动态 Skill 加载：manifest 必填 sha256 校验 + 可选 HMAC 签名 + AST import 白名单
+- 自研 Agent Runtime、持久化 checkpoint 与任务断点续跑
+- 灰度发布与影子流量、Web 管理台、任务 Dashboard
+- OpenTelemetry Trace、Prometheus 指标与持久化告警
+- JSON API 与 Markdown 报告
+
+### 三、写了但这台机器上跑不到
+
+留在仓库里是因为它们是降级路径的另一半，但**必须标注**：
+
+- Redis Streams ACK、Worker 租约、指数退避重试、死信队列
+  （`task_queue.py`；本机没装 `redis`，配了 URL 会直接报错而不是静默降级，
+  测试覆盖的是内存 ACK 后端）
+- Skill 的 Docker 隔离（`--network none`）；不配镜像时退化为
+  audit hook 子进程（拦 socket/subprocess/os.system 与越界 open），
+  且 `RLIMIT_AS`/`RLIMIT_CPU` **仅在 POSIX 生效**，Windows 上没有内存上限
+- PostgreSQL 后端已删除：无驱动、无测试，配了 URL 现在抛
+  `NotImplementedError`（见 `store.create_store`）
 
 ## 快速开始
 
@@ -273,7 +304,15 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Compose 会启动 PostgreSQL、Redis 和 EvoAgent。未配置这两项时，项目自动退回 SQLite 与进程内线程队列，适合本地演示。
+Compose 会启动 Redis 和 EvoAgent。两个后端的退化行为**不一样**，这是刻意的：
+
+- 不配 `EVOAGENT_REDIS_URL`：退回进程内线程队列（同样有 ACK、租约、
+  指数退避与死信队列，只是不跨进程），适合本地演示
+- 配了 `EVOAGENT_DATABASE_URL` 指向 PostgreSQL：直接抛 `NotImplementedError`
+
+区别在于**静默降级会不会骗人**。队列退回内存后语义仍然成立，跑起来的东西
+和你以为的一样；而存储退回 SQLite 时，你以为数据进了 Postgres，实际写在本地
+文件里——同一个"自动退回"，一个安全，一个是事故。所以后者宁可起不来。
 
 ## API
 
@@ -321,7 +360,7 @@ Compose 会启动 PostgreSQL、Redis 和 EvoAgent。未配置这两项时，项�
 HTTP / GitHub Webhook
         │
         ▼
- ReviewService ── TaskStore(SQLite / PostgreSQL)
+ ReviewService ── TaskStore(SQLite)
         │
         ▼
  ReviewHarness (EvoAgent Runtime / checkpoint / resume / budget / trace)
