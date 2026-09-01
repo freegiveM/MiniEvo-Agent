@@ -5,7 +5,6 @@ import unittest
 
 from evoagent.config import Settings
 from evoagent.evolution import EvolutionEngine, RegressionEvaluator
-from evoagent.fixer import SafeFixer
 from evoagent.models import Finding, Severity
 from evoagent.service import ReviewService
 from evoagent.store import TaskStore
@@ -27,22 +26,6 @@ class AdvancedFeatureTests(unittest.TestCase):
 
     def tearDown(self):
         os.unlink(self.path)
-
-    def test_safe_fixer_changes_only_supported_rules(self):
-        content = 'password = "secret-value"\nresult = eval(user_input)\nprint(result)\n'
-        findings = [
-            {"path": "app.py", "line": 1, "rule_id": "SEC-HARDCODED-SECRET"},
-            {"path": "app.py", "line": 2, "rule_id": "SEC-EVAL"},
-            {"path": "app.py", "line": 3, "rule_id": "REL-DEBUG-PRINT"},
-        ]
-        result = SafeFixer().apply(content, findings, "app.py")
-        self.assertIn("import os", result["content"])
-        # 断言语义而非引号风格：走 AST 路径时 ast.unparse 统一输出单引号，
-        # 走正则回退路径时保留双引号。两者都是正确修复，测试不应绑定某一种。
-        self.assertRegex(result["content"], r"""password = os\.environ\[['"]PASSWORD['"]\]""")
-        self.assertIn("eval(user_input)", result["content"])
-        self.assertNotIn("print(result)", result["content"])
-        self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
 
     def test_deepseek_and_free_openrouter_provider_presets(self):
         deepseek = settings(self.path)

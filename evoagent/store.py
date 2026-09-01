@@ -1240,3 +1240,29 @@ class TaskStore:
             "success_rate": round(success / total, 4) if total else 0.0,
             "unresolved_failure_cases": failures, "active_skill_versions": active_skills,
         }
+
+
+def create_store(database_url: str, sqlite_path: str) -> "TaskStore":
+    """存储后端工厂。
+
+    原来这里还有一个 PostgresTaskStore（939 行，与 TaskStore 平行实现
+    62 个方法）。删掉了，理由是**它从没被执行过**：psycopg 不是安装依赖，
+    没有一个测试覆盖它，EVOAGENT_DATABASE_URL 默认为空。
+
+    权衡过三条路：
+      1. 留着 —— 仓库多 939 行不能声称可用的代码。简历上写"支持
+         PostgreSQL"就是在讲一个没验证过的功能，面试里一问就穿。
+      2. 补测试补驱动 —— 要引真实 Postgres 才算真测过，投入远大于
+         这个项目的收益，而且它不在评测链路上。
+      3. 删掉，配了 Postgres URL 时**显式报错** —— 选这条。
+
+    选 3 的关键是不能静默降级到 SQLite：那样配了 Postgres 的人会以为
+    数据写进了 Postgres，实际写在本地文件里，出问题时排查方向全错。
+    报错难看但诚实。
+    """
+    if database_url.startswith(("postgres://", "postgresql://")):
+        raise NotImplementedError(
+            "PostgreSQL backend was removed: it had no test coverage and no "
+            "installed driver. Unset EVOAGENT_DATABASE_URL to use SQLite."
+        )
+    return TaskStore(sqlite_path)

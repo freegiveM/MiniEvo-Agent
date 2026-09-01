@@ -9,7 +9,6 @@ from .config import Settings
 from .context_manager import ContextManager
 from .evolution import EvolutionEngine
 from .evolution_v2 import RootCauseEvolutionGenerator
-from .fixer import SafeFixer
 from .patching import SuggestionOnlyFixer, VerifiedPatchFixer
 from .github import GitHubAppAuthenticator, GitHubClient
 from .harness import ReviewHarness
@@ -19,7 +18,6 @@ from .modes import RunMode
 from .memory import MemoryManager
 from .models import TaskState, TraceEvent
 from .observability import AlertManager, Observability
-from .postgres_store import create_store
 from .report import to_markdown
 from .reviewer import (
     OpenAICompatibleReviewer, ReliabilityRuleReviewer, SecurityRuleReviewer,
@@ -27,7 +25,7 @@ from .reviewer import (
 from .diff_parser import parse_unified_diff
 from .skills import SkillRegistry
 from .skill_evolution import DeclarativeSkillReviewer, SkillEvolutionEngine
-from .store import utc_now
+from .store import create_store, utc_now
 from .task_queue import PermanentTaskError, TaskQueue
 from .rollout import ReleaseManager
 from .verifier import RepairVerifier
