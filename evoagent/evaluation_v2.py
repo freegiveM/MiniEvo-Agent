@@ -100,6 +100,21 @@ def _not_worse(candidate, baseline) -> bool:
     return float(candidate) <= float(baseline)
 
 
+def _unmeasurable(conditions: Dict[str, Any]) -> List[str]:
+    """列出因为输入无定义而**测不出来**的门禁条件名。
+
+    `_not_worse` / `_ci_lower_positive` 都把 None 收成 False——判定方向是对的
+    （无法验证不退化，就不能当成没退化），但报告里 `passed: false` +
+    `f1_gain: null` 和"真的回退了"长得一模一样。读的人分不清是能力不行还是
+    这一档根本没样本。
+
+    这个函数不改任何门禁判定，只把区别写出来。与
+    `evaluation_harness.comparison_summary` 的 `not_applicable_gates` 同一纪律：
+    门禁照旧不放行，但"这条没验证"要显式可见。
+    """
+    return sorted(name for name, value in conditions.items() if value is None)
+
+
 def _ci_lower_positive(entry: dict) -> bool:
     """True only when the CI is present and its lower bound is above zero.
 
@@ -713,15 +728,17 @@ class FairAblationSuite:
         critic_false_positive_non_regression = _not_worse(
             candidate["invalid_comments_per_pr"], no_critic["invalid_comments_per_pr"]
         )
+        # 三态保留：None 表示两边有一侧 recall 无定义，测不出"是否退化"。
+        # 判定处再收成 False（`is True`），报告处能看见 None。
+        critic_recall_delta = _delta_or_none(candidate["recall"], no_critic["recall"])
         critic_recall_non_regression = (
-            candidate["recall"] is not None and no_critic["recall"] is not None
-            and candidate["recall"] >= no_critic["recall"] - 0.01
+            None if critic_recall_delta is None else critic_recall_delta >= -0.01
         )
         critic_statistically_positive = (
             _ci_lower_positive(critic_comparison["f1"])
             or (
                 _ci_lower_positive(critic_comparison["precision"])
-                and critic_recall_non_regression
+                and critic_recall_non_regression is True
             )
         )
         return {
@@ -739,6 +756,15 @@ class FairAblationSuite:
                 "minimum_f1_gain": 0.03, "high_risk_recall_gain": high_gain,
                 "minimum_high_risk_recall_gain": 0.05,
                 "false_positive_non_regression": false_positive_non_regression,
+                # 没通过时读的人要能分清"回退了"和"这一档没样本"。
+                "unmeasurable": _unmeasurable({
+                    "f1_gain": f1_gain,
+                    "high_risk_recall_gain": high_gain,
+                    "multi_agent_f1_ci": multi_comparison["f1"].get("ci95", [None])[0],
+                    "multi_agent_high_risk_recall_ci": multi_comparison[
+                        "high_risk_recall"
+                    ].get("ci95", [None])[0],
+                }),
                 "decision": (
                     "launch" if readiness["ready"] and launch and multi_statistically_positive
                     else "insufficient-evidence"
@@ -748,17 +774,27 @@ class FairAblationSuite:
                 "passed": bool(
                     readiness["ready"] and critic_statistically_positive
                     and critic_false_positive_non_regression
-                    and critic_recall_non_regression
+                    and critic_recall_non_regression is True
                 ),
                 "statistically_positive": critic_statistically_positive,
                 "false_positive_non_regression": critic_false_positive_non_regression,
                 "recall_non_regression_with_1pp_tolerance": critic_recall_non_regression,
+                "recall_delta": critic_recall_delta,
                 "production_dataset_ready": readiness["ready"],
+                "unmeasurable": _unmeasurable({
+                    "recall_non_regression_with_1pp_tolerance": (
+                        critic_recall_non_regression
+                    ),
+                    "critic_f1_ci": critic_comparison["f1"].get("ci95", [None])[0],
+                    "critic_precision_ci": critic_comparison[
+                        "precision"
+                    ].get("ci95", [None])[0],
+                }),
                 "decision": (
                     "keep-critic" if (
                         readiness["ready"] and critic_statistically_positive
                         and critic_false_positive_non_regression
-                        and critic_recall_non_regression
+                        and critic_recall_non_regression is True
                     ) else "critic-not-proven"
                 ),
             },

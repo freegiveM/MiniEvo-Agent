@@ -39,6 +39,15 @@ def main():
         help="Run for harness debugging but keep all proof/launch gates closed.",
     )
     parser.add_argument(
+        "--critic-position-check", action="store_true",
+        help=(
+            "Re-run Critic over the same candidates in reversed presentation "
+            "order and report position_consistency. Doubles Critic calls and "
+            "tokens, so it is off by default: it is an evaluation diagnostic "
+            "for the report's limitations section, not a production feature."
+        ),
+    )
+    parser.add_argument(
         "--output", default=os.path.join(
             ROOT, "output", "agentic-evaluation", "evaluation.json",
         ),
@@ -56,7 +65,10 @@ def main():
         provider=args.provider, timeout=args.timeout,
     )
     suite = FairAblationSuite(
-        product_reviewer_factories(client, args.time_budget),
+        product_reviewer_factories(
+            client, args.time_budget,
+            critic_position_check=args.critic_position_check,
+        ),
         args.model, args.token_budget,
         require_production_ready=not args.allow_non_production_data,
         bootstrap_iterations=args.bootstrap_iterations,
