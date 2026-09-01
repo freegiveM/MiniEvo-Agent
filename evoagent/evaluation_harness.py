@@ -471,6 +471,13 @@ class EndToEndEvaluationHarness:
             "execution_success": False,
             "repair_attempted": 0,
             "repair_passed": 0,
+            # 修复环节是否配置了。这个标记必须随结果一起走，不能在 _metrics
+            # 里读 self：_metrics 是静态方法，且要为每个 split 分别算一次。
+            # 它区分的是两件不同的事：
+            #   repairer is None      → 修复环节**没跑** → e2e 无定义 (None)
+            #   repairer 在但没匹配上 → 修复环节跑了没成 → e2e = 0.0
+            # 只看 repair_attempted == 0 无法区分这两者。
+            "repair_stage_active": self.repairer is not None,
             "e2e_success": False,
             "matches": [],
             "repair": [],
@@ -537,6 +544,8 @@ class EndToEndEvaluationHarness:
             "fn": 0, "severity_hits": 0, "high_total": 0, "high_hits": 0,
             "clean_hits": 0, "execution_successes": 0, "repair_attempted": 0,
             "repair_passed": 0, "e2e_successes": 0,
+            # False 是正确的初值：一个 case 都没跑过时，修复环节当然没跑过。
+            "repair_stage_active": False,
         }
 
     @staticmethod
@@ -552,6 +561,12 @@ class EndToEndEvaluationHarness:
         totals["clean_hits"] += int(result["clean_hit"])
         totals["execution_successes"] += int(result["execution_success"])
         totals["e2e_successes"] += int(result["e2e_success"])
+        # 只要有**任何**一个 case 跑过修复环节，这一批的 e2e 就是有定义的。
+        # 用 or 而不是 and：混合情形（部分 case 配了 repairer）下，
+        # e2e 至少对那部分有意义，报 None 会把已有的信息也丢掉。
+        totals["repair_stage_active"] = bool(
+            totals.get("repair_stage_active") or result.get("repair_stage_active")
+        )
 
     @staticmethod
     def _metrics(totals: Dict[str, int]) -> Dict[str, Any]:
@@ -608,7 +623,19 @@ class EndToEndEvaluationHarness:
                 totals["execution_successes"], totals["cases"]
             ),
             "safe_fix_rate": ratio(totals["repair_passed"], totals["repair_attempted"]),
-            "e2e_security_fix_rate": ratio(totals["e2e_successes"], totals["risk_cases"]),
+            # e2e 的分母是 risk_cases（非空），但分子恒为 0 —— 因为
+            # e2e_success 要求 repair_attempted == len(expected)，而修复环节
+            # 未配置时 repair_attempted 恒为 0。于是它会报出 0.0，读起来是
+            # "试了 100% 都失败"，真相是"从来没试"。
+            #
+            # 这与本函数开头讲的空分母是**同一类口径错误的镜像**：那次是
+            # 分母为 0 时编造 1.0，这次是分子恒 0 时编造出一个结论。
+            # safe_fix_rate 因为分母恰好也是 0，已经自动得到 None——
+            # 它是碰巧对的，不是设计对的。
+            "e2e_security_fix_rate": (
+                ratio(totals["e2e_successes"], totals["risk_cases"])
+                if totals.get("repair_stage_active") else None
+            ),
         }
 
 
