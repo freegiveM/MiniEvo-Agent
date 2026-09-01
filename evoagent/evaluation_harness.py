@@ -1,4 +1,5 @@
 """End-to-end PR diff evaluation with reproducible matching and repair gates."""
+import difflib
 import hashlib
 import json
 import re
@@ -321,6 +322,103 @@ def tiered_match(
     return result
 
 
+### 补丁改动范围断言 ###
+#
+# 没有这道断言时，一个改遍全文件的补丁能拿到 verified-draft：实测
+# REL-DEBUG-PRINT 的修复是 `re.sub` 全文替换，finding 指向第 2 行，
+# 补丁把 5 行文件里的 4 行 print 全删了——compile 过、风险移除过、
+# 回归断言过，于是判为"可复核的草稿"。可它删掉了三行与缺陷无关的代码。
+#
+# 这与 MAX_SEED_SPAN 是同一条纪律的另一端：那条管标注范围别太宽，
+# 这条管补丁范围别太宽。两者宽了都会让"命中"这件事失去意义。
+SCOPE_WINDOW = 5        # 允许改动的行数半径（finding 行 ± 5）
+                        # 取 5 而不是 0：真实修复常需要连带改几行——包一层
+                        # try、把单行拆成两行、补一个 early return。
+                        # 也不取 20（MAX_FIX_LINES 的值）：那是"整个 PR 的
+                        # 改动上限"，这里是"单个 finding 的邻域"，后者必须更紧，
+                        # 否则一个 PR 里两处相距 15 行的缺陷会互相掩护。
+
+
+def _changed_line_numbers(before: str, after: str) -> List[int]:
+    """补丁改动了原文的哪些行（按**原文**行号，1-based）。
+
+    用 SequenceMatcher 做对齐，不是逐下标比较。插入一行会让它后面所有行
+    的下标都错位，逐下标比较会把整个文件的余下部分都算成"改动过"，
+    于是断言对任何插入类补丁都误报。
+    """
+    before_lines = before.splitlines()
+    after_lines = after.splitlines()
+    changed: List[int] = []
+    matcher = difflib.SequenceMatcher(
+        a=before_lines, b=after_lines, autojunk=False)
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if i1 == i2:
+            # 纯插入：原文没有对应行。记插入点所在行，让它参与范围判定。
+            changed.append(i1 + 1)
+            continue
+        changed.extend(range(i1 + 1, i2 + 1))
+    return sorted(set(changed))
+
+
+def _is_import_insertion(tag: str, inserted: List[str]) -> bool:
+    """这一段改动是否是"纯插入 import"。
+
+    为什么要放行：_ensure_import 把 import 插在文件第一行，而 finding
+    可能在第 300 行。不放行的话每个需要补 import 的修复（secret → os、
+    eval → json）都会被判越界，断言就只剩噪声。
+
+    为什么按**段**判而不是整体判：整体判需要"整个补丁只插了 import"，
+    可 secret/eval 的修复形态恰恰是"头部插 import + 改 finding 那一行"
+    两段并存——整体判会把这种最常见的正常补丁判成越界（实测确认过）。
+    """
+    return tag == "insert" and bool(inserted) and all(
+        line.strip().startswith(("import ", "from ")) for line in inserted)
+
+
+def patch_scope_check(
+    before: str, after: str, finding_line: int, window: int = SCOPE_WINDOW,
+) -> Dict[str, Any]:
+    """补丁改动是否落在 finding 邻域内。返回一条 checks 项。
+
+    越界不单独设一档：一个改了 200 行无关代码的补丁，人类同样不能直接用，
+    它属于 blocked。档位记录的是"能不能用"，越界的原因记在 detail 里。
+    """
+    before_lines = before.splitlines()
+    after_lines = after.splitlines()
+    matcher = difflib.SequenceMatcher(
+        a=before_lines, b=after_lines, autojunk=False)
+    low, high = finding_line - window, finding_line + window
+    changed: List[int] = []
+    out_of_scope: List[int] = []
+    allowed_imports = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        lines = ([i1 + 1] if i1 == i2 else list(range(i1 + 1, i2 + 1)))
+        changed.extend(lines)
+        if _is_import_insertion(tag, after_lines[j1:j2]):
+            allowed_imports += 1
+            continue
+        out_of_scope.extend(line for line in lines if not low <= line <= high)
+    changed = sorted(set(changed))
+    if not changed:
+        # 没有改动。这不是越界，是"没生成补丁"——由 patch-generated 那项负责。
+        return {"name": "patch-scope", "passed": True, "changed_lines": []}
+    out_of_scope = sorted(set(out_of_scope))
+    return {
+        "name": "patch-scope",
+        "passed": not out_of_scope,
+        "changed_lines": changed,
+        "out_of_scope": out_of_scope,
+        "import_insertions": allowed_imports,
+        "detail": "" if not out_of_scope else (
+            "%d line(s) outside %d±%d" % (len(out_of_scope), finding_line, window)
+        ),
+    }
+
+
 class FixtureRepairer:
     """Conservative deterministic repairer used by the controlled benchmark.
 
@@ -355,6 +453,9 @@ class FixtureRepairer:
             re.search(pattern, repaired, re.MULTILINE) for pattern in required
         )
         checks.append({"name": "regression-tests", "passed": regression_passed})
+        # 范围断言放在最后：它是"这个补丁能不能给人看"的判定，
+        # 前面几项先确认补丁本身有效，顺序符合读报告的思路。
+        checks.append(patch_scope_check(content, repaired, finding.line))
         return {
             "passed": all(item["passed"] for item in checks),
             "checks": checks,
