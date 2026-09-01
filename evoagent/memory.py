@@ -1,4 +1,30 @@
-"""Tenant-aware working, episodic and semantic memory for review agents."""
+"""Tenant-aware working, episodic and semantic memory for review agents.
+
+**这个模块刻意没有接进 agentic_core（评测链路）。** 记一下为什么，
+否则下一个人看到"写了分层记忆但评测里没用"会当成漏接的活儿去补。
+
+三条路都想过：
+
+1. 接进 agentic_core，让 specialist 能召回历史审查结论。
+2. 留在 service.py（产品链路）不动，README 里标明它不在评测链路上。← 选这条
+3. 挪到 prototypes/。
+
+选 2、不选 1 的理由不是工作量，是**接进去会毁掉评测本身**。基准集的
+holdout 之所以能说明问题，前提是每个 case 相互独立；一旦跨 case 记忆，
+审第 N 个 case 时会召回第 N-1 个的结论，独立性就没了：
+- 同类缺陷在基准集里重复出现，第二次的"发现"可能是召回而不是检出，
+  指标会虚高，而且是**朝着我们希望的方向**虚高（最难发现的偏差）；
+- Validation 上调过的提示词，其收益会通过记忆漏到 Holdout，
+  那条"Holdout 提升远小于 Validation"的检验就失效了——而这条检验
+  正是整个评测里唯一能挡住过拟合的东西。
+
+要接的话得先有隔离手段（按 case 分租户 + 每个 case 跑完清空），
+那是另一件事，成本比"接上去"高得多，收益也要单独量。在有那套隔离之前，
+不接是正确答案，不是欠的债。
+
+不选 3 是因为 prototypes/ 的判据是"没被量过**且当前没在用**"；
+这个模块是 service.py 在跑的活代码，有单测，只是不在评测口径内。
+"""
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
