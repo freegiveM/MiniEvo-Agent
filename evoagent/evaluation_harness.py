@@ -403,6 +403,44 @@ class FixtureRepairer:
         return "import %s\n" % module + content
 
 
+### 修复环节的分档口径 ###
+#
+# 为什么不报单一成功率：safe_fix_rate = repair_passed / repair_attempted
+# 把三种完全不同的失败塞进同一个"没通过"里，而它们对使用者的含义相反：
+#   没生成补丁          → agent 认了怂，人类什么都没得到，但也没被误导
+#   生成了但没过验证    → agent 给了个错的补丁，验证挡住了 → 系统是安全的
+#   生成了且过了验证    → 人类拿到一份可复核的草稿
+# 前两者合并成一个数字，就看不出"挡住了多少"这件事——而那恰恰是这套
+# 验证环节唯一的价值所在。一个 0.3 的 safe_fix_rate 可能是"七成没敢动"，
+# 也可能是"七成给错了但都被拦下"，两种系统完全不该给同样的评价。
+REPAIR_VERIFIED = "verified-draft"      # 全部检查通过：可复核的草稿
+REPAIR_BLOCKED = "blocked"              # 生成了补丁但验证不通过：被拦下
+REPAIR_SUGGESTION = "suggestion-only"   # 没生成补丁：只给了意见
+# 第四种状态，**不是第四档质量**，而是"这一档没法判"：
+# 原始代码里连风险都没复现出来，那么"风险是否被移除"这项检查无意义。
+# 它是配置/夹具问题，不是修复能力问题。混进 blocked 会把配置错误
+# 记成 agent 的失败——和 None ≠ 0.0 同一条纪律。
+REPAIR_UNREPRODUCED = "unreproduced"
+
+REPAIR_TIERS = (REPAIR_VERIFIED, REPAIR_BLOCKED, REPAIR_SUGGESTION,
+                REPAIR_UNREPRODUCED)
+
+
+def repair_tier(repair: Dict[str, Any]) -> str:
+    """把一次修复结果归入某一档。
+
+    判定顺序是有意的：先问"风险复现了吗"（前提），再问"有补丁吗"（意愿），
+    最后才问"补丁对吗"（能力）。顺序反了会把前提失败误记成能力失败。
+    """
+    checks = {str(item.get("name")): bool(item.get("passed"))
+              for item in repair.get("checks") or []}
+    if "risk-reproduction" in checks and not checks["risk-reproduction"]:
+        return REPAIR_UNREPRODUCED
+    if not checks.get("patch-generated", False):
+        return REPAIR_SUGGESTION
+    return REPAIR_VERIFIED if repair.get("passed") else REPAIR_BLOCKED
+
+
 class EndToEndEvaluationHarness:
     def __init__(
         self, line_tolerance: int = 2, repairer: Optional[FixtureRepairer] = None,
@@ -478,6 +516,7 @@ class EndToEndEvaluationHarness:
             #   repairer 在但没匹配上 → 修复环节跑了没成 → e2e = 0.0
             # 只看 repair_attempted == 0 无法区分这两者。
             "repair_stage_active": self.repairer is not None,
+            "repair_tiers": {tier: 0 for tier in REPAIR_TIERS},
             "e2e_success": False,
             "matches": [],
             "repair": [],
@@ -522,9 +561,12 @@ class EndToEndEvaluationHarness:
                     result["repair_attempted"] += 1
                     repair = self.repairer.repair(case, finding)
                     result["repair_passed"] += int(repair["passed"])
+                    tier = repair_tier(repair)
+                    result["repair_tiers"][tier] += 1
                     result["repair"].append({
                         "expected_index": match.expected_index,
                         "passed": repair["passed"],
+                        "tier": tier,
                         "checks": repair["checks"],
                     })
             result["e2e_success"] = bool(
@@ -546,6 +588,7 @@ class EndToEndEvaluationHarness:
             "repair_passed": 0, "e2e_successes": 0,
             # False 是正确的初值：一个 case 都没跑过时，修复环节当然没跑过。
             "repair_stage_active": False,
+            **{"repair_%s" % tier.replace("-", "_"): 0 for tier in REPAIR_TIERS},
         }
 
     @staticmethod
@@ -558,6 +601,9 @@ class EndToEndEvaluationHarness:
             "repair_attempted", "repair_passed",
         ):
             totals[field] += int(result[field])
+        for tier, count in (result.get("repair_tiers") or {}).items():
+            key = "repair_%s" % tier.replace("-", "_")
+            totals[key] = totals.get(key, 0) + int(count)
         totals["clean_hits"] += int(result["clean_hit"])
         totals["execution_successes"] += int(result["execution_success"])
         totals["e2e_successes"] += int(result["e2e_success"])
@@ -622,7 +668,24 @@ class EndToEndEvaluationHarness:
             "execution_success_rate": ratio(
                 totals["execution_successes"], totals["cases"]
             ),
+            # 保留 safe_fix_rate：历史数字要能复算，门禁也在用它。
+            # 但它是**有损**的——三档合并成一个数，见 REPAIR_VERIFIED 处的
+            # 说明。答辩时应该报下面的三档，safe_fix_rate 只作为对照。
             "safe_fix_rate": ratio(totals["repair_passed"], totals["repair_attempted"]),
+            # 三档各自的占比。分母统一用 judgeable（= attempted - unreproduced）：
+            # 风险没复现的样本压根没进入"修复能力"的判定范围，留在分母里会
+            # 把配置问题稀释进能力指标。分母为 0 仍返回 None，不返回 0.0。
+            "repair_judgeable": max(
+                0, totals["repair_attempted"] - totals["repair_unreproduced"]),
+            "verified_draft_rate": ratio(
+                totals["repair_verified_draft"],
+                totals["repair_attempted"] - totals["repair_unreproduced"]),
+            "blocked_rate": ratio(
+                totals["repair_blocked"],
+                totals["repair_attempted"] - totals["repair_unreproduced"]),
+            "suggestion_only_rate": ratio(
+                totals["repair_suggestion_only"],
+                totals["repair_attempted"] - totals["repair_unreproduced"]),
             # e2e 的分母是 risk_cases（非空），但分子恒为 0 —— 因为
             # e2e_success 要求 repair_attempted == len(expected)，而修复环节
             # 未配置时 repair_attempted 恒为 0。于是它会报出 0.0，读起来是
