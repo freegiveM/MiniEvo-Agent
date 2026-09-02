@@ -186,6 +186,41 @@ class ClassificationTests(unittest.TestCase):
             uncovered,
         )
 
+    def test_the_rule_set_cannot_reach_an_ordinary_real_world_fix(self):
+        """规则集在真实 bugfix 上几乎全盲，这是 D6 读数的前提，得钉住。
+
+        上一条按**类别**算召回上限；这条按**样本**算。实测 344 条真实
+        merged bugfix（放开配额重放全部缓存 diff），reviewer 的 6 条规则
+        总共只命中 4 条（1.2%）：SEC-SUBPROCESS-SHELL 2、SEC-EVAL 1、
+        REL-DEBUG-PRINT 1。
+
+        原因不是规则写得差，是**能被字面规则命中的缺陷通常不会成为
+        merged bugfix**——CI 的 linter 在提交阶段就拦掉了。
+
+        为什么这条要写成测试：D6 会拿臂 A（rules-only）当对照组。如果
+        不事先钉住"臂 A 在真实集上接近 0"，那么"LLM 远好于规则"这个结论
+        会被当成模型能力的证据，而它其实主要是对照组选择的后果。这个数字
+        必须在跑实验**之前**就摆在报告里。
+
+        这里用一段普通的边界修复做代表，不是抽象断言：它是真实数据里最
+        常见的形态（logic-boundary 占 89%），而规则集对它完全无感。
+        """
+        from evoagent.reviewer import LocalRuleReviewer
+
+        # 一个典型的真实边界缺陷：少减了 1，导致读到越界。
+        ordinary_defect = "        return items[offset + count]"
+        matched = [
+            rule[0] for rule in LocalRuleReviewer.RULES if rule[2].search(ordinary_defect)
+        ]
+        self.assertEqual([], matched)
+
+        # 反面：规则集确实能命中它设计要命中的那几种，所以上面的空结果
+        # 不是因为规则表是空的或正则全坏了。
+        self.assertTrue(any(
+            rule[2].search("    subprocess.run(cmd, shell=True)")
+            for rule in LocalRuleReviewer.RULES
+        ))
+
 
 class DifficultyTests(unittest.TestCase):
     def test_single_line_with_a_literal_signature_is_l1(self):

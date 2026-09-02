@@ -383,13 +383,38 @@ def classify_defect_with_basis(
 # 难点仍在运行时语义，不在上下文范围。范围小 ≠ 容易。
 # 为什么 L1 需要"规则可命中"这个条件：单行但无字面特征（例如把 `>` 改成 `>=`）
 # 不是 L1——规则集碰不到它，它对系统的难度和单函数级相当。
+#
+# ── L1 在真实数据上几乎不存在，这是定义的后果不是采样的运气 ──────────
+#
+# 采集后对账 repos.yaml 的先验预期，L1 实际产出 1/95（计划里六个仓库都
+# 标了 L1 倾向）。放开配额重放全部 1020 个缓存 diff 后仍是 1/344。
+# 拆开 L1 的两个条件量：
+#
+#     种子只有 1 行            155/344 (45.1%)
+#     命中 L1_LITERAL 字面特征   3/344 ( 0.9%)   ← 瓶颈在这里
+#     两个都满足 = L1            1/344 ( 0.3%)
+#
+# 原因是可以事后想明白的：eval(、shell=True、hashlib.md5、硬编码口令
+# 这些形态，在成熟仓库里活不到需要开 PR 修——CI 的 linter/bandit 在
+# 提交阶段就拦掉了。**能被字面规则命中的缺陷，通常不会成为 merged
+# bugfix**。所以从 merged bugfix 反转构造，先天就采不到 L1。
+#
+# 不改 L1_LITERAL 去把数字凑上来：放宽它等于让 L1 名不副实（L1 的定义
+# 就是"规则集碰得到"，放宽后规则集碰不到的样本会被标成 L1，D6 对照实验
+# 里臂 A 在 L1 上应当有召回这个预期就不成立了）。正确的处理是承认这条
+# 难度档在本构造方法下取不到样本，报数时明确写"L1 由受控基准集覆盖，
+# 真实数据集不含 L1"——受控基准集里本来就有这类样本，两者互补。
 
 L4_CLASSES = frozenset({"concurrency", "resource-leak"})
 
-# 与 evoagent/reviewer.py 的 14 条规则同源的字面特征（判 L1 用）。
+# 与 evoagent/reviewer.py 的 6 条规则同源的字面特征（判 L1 用）。
 # 这里不 import LocalRuleReviewer.RULES：分级判据必须和 reviewer 解耦，
 # 否则将来给 reviewer 加规则会**回溯改变已发布数据集的难度标签**，
 # 使历史数字不可比。宁可少量重复，换取数据集标签的稳定性。
+#
+# 注：本表比 reviewer 的 6 条更宽（多了 hashlib.md5、verify=False、
+# yaml.load、pickle.loads、mktemp）。刻意的：难度分级问的是"这类缺陷
+# 是否属于字面可查的一档"，不是"当前这版 reviewer 恰好实现了哪几条"。
 L1_LITERAL = re.compile(
     r"(?i)(\b(eval|exec)\s*\(|shell\s*=\s*True|hashlib\.(md5|sha1)|"
     r"yaml\.load\s*\((?![^)]*Loader)|pickle\.loads?\s*\(|"
