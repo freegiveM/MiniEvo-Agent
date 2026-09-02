@@ -695,6 +695,16 @@ class CoverageReportTests(unittest.TestCase):
         self.assertTrue(violation)
         self.assertIn("fallback default", violation[0])
         self.assertIn("7/10", violation[0])
+        # 这条告警的**措辞**也要钉住，不只是它出现了。
+        #
+        # 它的作用是拦住读者误用类别分布，而误用是靠读文字避免的，不是靠
+        # 退出码——报告表格会被单独截图贴进汇报材料，退出码跟不过去。
+        # 两个必须在场的成分：
+        # 1. 指名是哪张表（原来写的是 "the class distribution below"，
+        #    而 basis 表插在中间之后 "below" 指代到了错的表格）
+        # 2. 明确的禁止动作，而不只是描述现象
+        self.assertIn("'defect class' distribution", violation[0])
+        self.assertIn("Do not report per-class metrics", violation[0])
 
     def test_a_mostly_judged_distribution_does_not_trigger_the_violation(self):
         """判出来的占多数时不能报这条，否则告警失去区分力。"""

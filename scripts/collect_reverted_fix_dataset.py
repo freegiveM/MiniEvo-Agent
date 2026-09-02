@@ -37,6 +37,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from evoagent.dataset_builder import (  # noqa: E402
+    MAX_FALLBACK_SHARE,
     CaseRejected,
     PullRequest,
     build_case,
@@ -290,17 +291,31 @@ def print_report(cases: list, rejections: dict) -> bool:
     report = summarise(cases, rejections)
     print("\n" + "=" * 66)
     print("collected %d cases" % report.total)
+    # 顺序有讲究：defect class basis **紧跟** defect class。
+    # 原来这两块被 contamination / label provenance 隔开了，注释写着"紧跟"
+    # 但代码不是——读者看完 "logic-boundary 89%" 会直接往下用，隔了两块
+    # 表格才看到"其中 61% 是兜底值"就晚了。
+    fallback_share = 0.0
+    if report.total:
+        fallback_share = (
+            report.by_class_basis.get("fallback-default", 0) / report.total
+        )
     for title, bucket in (
         ("split", report.by_split),
         ("difficulty", report.by_difficulty),
         ("defect class", report.by_class),
+        ("defect class basis", report.by_class_basis),
         ("contamination", report.by_contamination),
         ("label provenance", report.by_provenance),
-        # 紧跟在 defect class 之后报：读者看完类别分布，下一眼就该看到
-        # 这个分布里有多少是判出来的、多少是兜底的。
-        ("defect class basis", report.by_class_basis),
     ):
         print("\n%s:" % title)
+        # 兜底占比过线时，直接把"别拿这张表报数"贴在表头上。
+        # 光靠末尾的 WARNINGS 块不够：表格是会被单独截图贴进报告的，
+        # 警告留在几十行之后就跟着丢了。
+        if title == "defect class" and fallback_share > MAX_FALLBACK_SHARE:
+            print("  (%.0f%% of these labels are fallback defaults — see "
+                  "'defect class basis' below; do NOT report per-class metrics)"
+                  % (100.0 * fallback_share))
         for key in sorted(bucket):
             share = 100.0 * bucket[key] / max(1, report.total)
             print("  %-18s %3d  (%4.1f%%)" % (key, bucket[key], share))

@@ -963,10 +963,10 @@ def summarise(cases: Iterable[dict], rejections: Optional[Dict[str, int]] = None
     if report.total and fallback > report.total * MAX_FALLBACK_SHARE:
         report.warnings.append(
             "HARD CONSTRAINT VIOLATED: %d/%d (%.0f%%) of cases got their "
-            "defect_class from the fallback default, not from a match. The class "
-            "distribution below is therefore not a finding about these defects — "
-            "it mostly reports what the classifier could not identify. Do not "
-            "report per-class metrics until this is under %.0f%%."
+            "defect_class from the fallback default, not from a match. The "
+            "'defect class' distribution is therefore not a finding about these "
+            "defects — it mostly reports what the classifier could not identify. "
+            "Do not report per-class metrics until this is under %.0f%%."
             % (fallback, report.total, 100.0 * fallback / report.total,
                100.0 * MAX_FALLBACK_SHARE)
         )
