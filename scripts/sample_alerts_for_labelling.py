@@ -41,13 +41,28 @@ def build_reviewer(kind: str):
     if kind == "rules":
         from evoagent.reviewer import LocalRuleReviewer
         return LocalRuleReviewer()
+    if kind == "llm":
+        from evoagent.config import Settings
+        from evoagent.reviewer import OpenAICompatibleReviewer
+        resolved = Settings.from_env().resolved_llm()
+        if not resolved:
+            raise SystemExit(
+                "未配置 LLM：设置 EVOAGENT_LLM_PROVIDER=deepseek 和 "
+                "EVOAGENT_DEEPSEEK_API_KEY（或对应 provider 的 key），"
+                "写进 .env 或环境变量后重跑。"
+            )
+        return OpenAICompatibleReviewer(
+            base_url=resolved["base_url"], api_key=resolved["api_key"],
+            model=resolved["model"], provider=resolved["provider"],
+            extra_headers=resolved.get("headers") or {}, timeout=240,
+        )
     raise SystemExit("未知 reviewer: %s" % kind)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="datasets/real-pr-v1.jsonl")
-    parser.add_argument("--reviewer", default="rules", choices=["rules"])
+    parser.add_argument("--reviewer", default="rules", choices=["rules", "llm"])
     parser.add_argument("--round", default="r1")
     parser.add_argument("--seed", type=int, required=True,
                         help="两轮重测必须用同一个种子，否则抽的不是同一批")
@@ -64,7 +79,9 @@ def main() -> int:
         print("  受控基准的告警分布窄（规则集只覆盖 6 类），"
               "算出的有效告警率代表性有限，不能与真实 PR 集的数字混看。")
 
-    records = collect_alerts(build_reviewer(args.reviewer), cases)
+    records = collect_alerts(build_reviewer(args.reviewer), cases,
+                              skip_errors=(args.reviewer == "llm"),
+                              max_workers=(8 if args.reviewer == "llm" else 1))
     print("告警总数 %d，落在标注集范围内 %d"
           % (len(records), sum(1 for item in records if item.in_label_scope)))
     if len(records) < args.size:

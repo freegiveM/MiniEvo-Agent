@@ -104,16 +104,45 @@ def in_label_scope(
 
 def collect_alerts(
     reviewer, cases: Sequence[dict], excerpt_lines: int = 6,
+    skip_errors: bool = False, max_workers: int = 1,
 ) -> List[AlertRecord]:
-    """跑 reviewer，把它产出的每条告警转成一条待标注记录。"""
+    """跑 reviewer，把它产出的每条告警转成一条待标注记录。
+
+    skip_errors=True 时单个 case 抛异常只跳过该 case（打印原因），不中断整批。
+    默认关闭：规则类 reviewer 从不应该抛异常，抛了就是真 bug，不该吞掉。
+    只有跑真实网络请求的 reviewer（例如 LLM）才该打开——一次超时不该让
+    前面几十条已经花钱换来的调用结果全部作废。
+
+    max_workers>1 时用线程池并发跑 reviewer 调用。默认 1（串行），
+    对规则类 reviewer 无所谓快慢；LLM reviewer 单条请求几十到几百秒，
+    95 条串行能拖到小时级，并发是让这条路径可用的必要条件而不是优化。
+    用 executor.map 保序：抽样脚本靠种子复现同一批样本，records 顺序
+    必须和 cases 顺序一致，乱序会让两轮重测抽到不同的子集。
+    """
+    from concurrent.futures import ThreadPoolExecutor
     from .diff_parser import parse_unified_diff
 
-    records: List[AlertRecord] = []
-    for case in cases:
+    def _review_one(case: dict):
         parsed = parse_unified_diff(case["diff"])
         review_case = getattr(reviewer, "review_case", None)
-        findings = (review_case(case, parsed) if review_case
-                    else reviewer.review(case["diff"], parsed))
+        try:
+            findings = (review_case(case, parsed) if review_case
+                        else reviewer.review(case["diff"], parsed))
+        except Exception as exc:
+            if not skip_errors:
+                raise
+            print("! case %s 跳过：%s" % (case.get("id", "?"), str(exc)[:200]))
+            return case, []
+        return case, findings
+
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            results = list(pool.map(_review_one, cases))
+    else:
+        results = [_review_one(case) for case in cases]
+
+    records: List[AlertRecord] = []
+    for case, findings in results:
         expected = case.get("expected_findings") or []
         for finding in findings:
             records.append(AlertRecord(
