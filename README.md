@@ -112,7 +112,7 @@
 `pyproject.toml`。
 
 ```bash
-git clone <仓库地址> && cd EvoAgent-another-project
+git clone https://github.com/freegiveM/MiniEvo-Agent.git && cd MiniEvo-Agent
 python -m pip install -r requirements.txt
 python -m pytest -q          # 不需要 API key、不需要联网
 ```

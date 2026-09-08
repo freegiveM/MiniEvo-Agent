@@ -5,7 +5,7 @@
 Python 3.11（硬下限，理由见 `pyproject.toml`）。
 
 ```bash
-git clone <your-fork-url> && cd EvoAgent-another-project
+git clone <your-fork-url> && cd MiniEvo-Agent
 python -m pip install -r requirements.txt
 python -m pytest -q
 ```
