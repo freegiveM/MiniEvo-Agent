@@ -50,14 +50,16 @@ Bootstrap 管理员只在用户名尚不存在时创建；已有同名用户的�
 
 ### 提一次审查
 
-API 调用需要先登录并携带 Bearer Token。`repository` 是必填的。
+API 调用需要先登录并携带 Bearer Token。登录用的是上面启动时设定的
+`EVOAGENT_BOOTSTRAP_ADMIN_USERNAME` / `EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD`
+——这是本服务自己的账号，与 GitHub 账号无关。`repository` 是必填的。
 
 **curl（Linux / macOS / Git Bash）：**
 
 ```bash
 TOKEN=$(curl -s -X POST http://127.0.0.1:8080/v1/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"<你的密码>"}' \
+  -d '{"username":"admin","password":"<BOOTSTRAP_ADMIN_PASSWORD 的值>"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
 
 curl -s -X POST http://127.0.0.1:8080/v1/reviews \
@@ -71,7 +73,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/reviews \
 ```powershell
 $session = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/v1/auth/login `
   -ContentType 'application/json' `
-  -Body (@{username='admin'; password='<你的密码>'} | ConvertTo-Json)
+  -Body (@{username='admin'; password='<BOOTSTRAP_ADMIN_PASSWORD 的值>'} | ConvertTo-Json)
 $headers = @{Authorization="Bearer $($session.access_token)"}
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/v1/reviews `
   -Headers $headers `
