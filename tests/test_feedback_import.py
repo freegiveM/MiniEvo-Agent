@@ -32,6 +32,7 @@ from evoagent.feedback_import import (
     LABEL_SHOULD_HAVE,
     LABEL_UNLABELLED,
     LABEL_VALID,
+    SOURCE_MODEL_LABELLED,
     apply_worksheet,
     blind,
     build_payload,
@@ -259,6 +260,31 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual("c1", provenance["case_id"])
         self.assertEqual(LABEL_SHOULD_HAVE, provenance["label"])
         self.assertEqual("linked-issue", provenance["label_provenance"])
+
+    def test_a_model_labelled_batch_does_not_claim_human_confirmation(self):
+        """**关键口径。**
+
+        模型标注的候选走同一条路径进库。`import_confirmed` 只看 label 和
+        kind，它无从知道那个 label 是谁填的；provenance 是唯一记录这件事
+        的地方。source 曾经是常量，于是模型标注的反馈在库里与人工确认的
+        完全一样——note 里的 `[model-labelled]` 前缀挡不住这个，
+        `HUMAN_CONFIRMED_CATEGORIES` 那道白名单挡的是 category，对来源
+        不实的 provenance 完全无感。
+        """
+        candidate = derive_candidates([_case()], {"c1": []})[0]
+        candidate["label"] = LABEL_SHOULD_HAVE
+        payload = build_payload(candidate, source=SOURCE_MODEL_LABELLED)
+
+        self.assertEqual("d6-replay-model-labelled",
+                         payload["provenance"]["source"])
+
+    def test_an_unknown_source_is_rejected_rather_than_written_through(self):
+        """自由字符串会让溯源变成一个谁都能写的备注栏：拼错一个字母就
+        产生一个新的"来源"，而按来源筛反馈的查询会静默漏掉它。"""
+        candidate = derive_candidates([_case()], {"c1": []})[0]
+        candidate["label"] = LABEL_SHOULD_HAVE
+        with self.assertRaises(ValueError):
+            build_payload(candidate, source="looks-official-enough")
 
 
 class ImportTests(unittest.TestCase):

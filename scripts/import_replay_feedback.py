@@ -52,6 +52,8 @@ from evoagent.feedback_import import (
     KIND_UNMATCHED_EXPECTED,
     KIND_UNMATCHED_FINDING,
     KINDS,
+    SOURCE_HUMAN_CONFIRMED,
+    SOURCES,
     apply_worksheet,
     blind,
     derive_candidates,
@@ -133,9 +135,11 @@ def _import(args):
                  for case in _load_dataset(args.dataset)}
     store = create_store("", args.db)
     result = import_confirmed(
-        store, payload, tenant_id=args.tenant, diffs=diffs)
+        store, payload, tenant_id=args.tenant, diffs=diffs,
+        source=args.source)
     print(json.dumps({
         "imported_count": result["imported_count"],
+        "source": args.source,
         "categories": result["categories"],
         "skipped_already_imported": len(result["skipped_already_imported"]),
         "skipped_not_feedback": len(result["skipped_not_feedback"]),
@@ -251,6 +255,12 @@ def main():
     importer.add_argument("--tenant", default="default")
     importer.add_argument("--dataset", default="datasets/real-pr-v1.jsonl",
                           help="用于把样本 diff 一并存进 task_payloads")
+    # 默认人工确认：绝大多数导入走的是两步 CLI 那条人工路径，默认值写成
+    # model-labelled 会让真正的人工标注被低估。模型标注的批次必须显式声明，
+    # 见 feedback_import.SOURCES。
+    importer.add_argument("--source", default=SOURCE_HUMAN_CONFIRMED,
+                          choices=list(SOURCES),
+                          help="这批 label 是谁填的，写进 provenance.source")
 
     args = parser.parse_args()
     if args.command == "derive":

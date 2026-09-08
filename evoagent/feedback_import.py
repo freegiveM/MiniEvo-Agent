@@ -107,6 +107,18 @@ ALLOWED_LABELS = {
         LABEL_SHOULD_HAVE, LABEL_NOT_EXPECTED, LABEL_UNLABELLED),
 }
 
+# 标注是谁做的。写进 `payload.provenance.source` 和任务元数据。
+#
+# 这两个值**不可互换**，也不允许调用方随手传字符串：`import_confirmed`
+# 只看 label 和 kind，它无从知道那个 label 是人填的还是模型填的。溯源
+# 是唯一记录这件事的地方，所以它必须由调用方显式声明，且只能取这两个值
+# 之一——写死成"human-confirmed"会让模型标注的反馈冒充人工确认，而
+# `HUMAN_CONFIRMED_CATEGORIES` 那道白名单挡的是 category，对来源不实的
+# provenance 完全无感。
+SOURCE_HUMAN_CONFIRMED = "d6-replay-human-confirmed"
+SOURCE_MODEL_LABELLED = "d6-replay-model-labelled"
+SOURCES = (SOURCE_HUMAN_CONFIRMED, SOURCE_MODEL_LABELLED)
+
 
 def load_replay_checkpoint(path: str) -> Dict[str, List[Finding]]:
     """读回放 checkpoint，还原成 case_id → findings。
@@ -359,7 +371,9 @@ def validate_labels(candidates: Sequence[dict]) -> Dict[str, Any]:
     }
 
 
-def build_payload(candidate: dict) -> Dict[str, Any]:
+def build_payload(
+    candidate: dict, source: str = SOURCE_HUMAN_CONFIRMED,
+) -> Dict[str, Any]:
     """一条确认候选对应的 `failure_cases.payload`。
 
     ## rule_id 只在人工填了的时候才写
@@ -375,7 +389,18 @@ def build_payload(candidate: dict) -> Dict[str, Any]:
 
     所以 rule_id 留给人工填；没填就不写这个键，`learned_rule_ids` 自然
     跳过它，反馈仍然通过类别计数生效。
+
+    ## source 必须由调用方声明，不能写死
+
+    这个字段曾经是常量 `d6-replay-human-confirmed`。模型标注的那批候选
+    走同一条路径进库，于是 provenance 会声称有人确认过——而实际没有。
+    note 里的 `[model-labelled]` 前缀挡不住这个：溯源字段才是三个月后
+    有人拿来判断"这条 failure_case 凭什么存在"的东西，它撒谎比没有更糟。
+    `HUMAN_CONFIRMED_CATEGORIES` 那道白名单挡的是 category，对一个字面
+    合法但来源不实的 provenance 完全无感。
     """
+    if source not in SOURCES:
+        raise ValueError("unknown feedback source: %s" % source)
     finding: Dict[str, Any] = {
         "path": candidate["path"],
         "line": int(candidate["line"]),
@@ -392,7 +417,7 @@ def build_payload(candidate: dict) -> Dict[str, Any]:
         # 溯源：这条反馈是从哪次回放、哪个样本、哪个标签来的。没有这个，
         # 三个月后没人能回答"这条 failure_case 凭什么存在"。
         "provenance": {
-            "source": "d6-replay-human-confirmed",
+            "source": source,
             "candidate_id": candidate["candidate_id"],
             "case_id": candidate["case_id"],
             "kind": candidate["kind"],
@@ -406,6 +431,7 @@ def import_confirmed(
     store, payload: Dict[str, Any], tenant_id: str = "default",
     task_prefix: str = "d6-feedback",
     diffs: Optional[Dict[str, str]] = None,
+    source: str = SOURCE_HUMAN_CONFIRMED,
 ) -> Dict[str, Any]:
     """把**已确认**的候选写进 `failure_cases`。
 
@@ -436,7 +462,13 @@ def import_confirmed(
     `task_id` 逐条查，不扫 `list_failure_cases`——后者上限 500 行，表一长
     早期导入的行就落在窗口外，于是"没查到"被读成"没导过"，同一条反馈重复
     入库，而且是在数据变多之后才开始出错。
+
+    `source` 一路透传到任务元数据和 `payload.provenance`，默认人工确认。
+    模型标注的批次必须显式传 `SOURCE_MODEL_LABELLED`，否则它在库里与人工
+    确认的反馈无法区分——见 `build_payload` 的说明。
     """
+    if source not in SOURCES:
+        raise ValueError("unknown feedback source: %s" % source)
     candidates = payload.get("candidates", [])
     diffs = diffs or {}
     imported: List[dict] = []
@@ -470,13 +502,14 @@ def import_confirmed(
         store.create(
             task_id, candidate.get("repository", "") or "unknown",
             candidate.get("pull_request"),
-            {"source": "d6-replay-human-confirmed", "case_id": candidate["case_id"]},
+            {"source": source, "case_id": candidate["case_id"]},
             tenant_id,
         )
         diff = diffs.get(candidate["case_id"])
         if diff:
             store.save_task_payload(task_id, diff)
-        store.record_failure_case(task_id, category, build_payload(candidate))
+        store.record_failure_case(
+            task_id, category, build_payload(candidate, source=source))
         imported.append({"candidate_id": candidate_id, "category": category,
                          "task_id": task_id, "diff_saved": bool(diff)})
 
