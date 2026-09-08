@@ -49,6 +49,11 @@ MAX_SEED_SPAN = 10      # 单个种子缺陷允许跨的连续行数上限
                         # 命中判定越宽松，指标越虚高。10 行以上的连续新增
                         # 已经不能说"缺陷就在这几行"了，宁可丢样本。
 
+# clean split（负样本）专用：一个 PR 合并后要经过多久才敢当作"没有已知问题"
+# 的代理信号。这不是"验证过无缺陷"，只是"在这个窗口内没有被发现"——
+# 见 build_clean_case 的 source.note。
+CLEAN_COOLDOWN_DAYS = 180
+
 TEST_PATH = re.compile(r"(^|/)(tests?|testing)/|(^|/)test_[^/]*\.py$|_test\.py$")
 
 # PR 标题/正文的 bugfix 关键词。刻意不含 "improve" / "update" / "change"
@@ -736,6 +741,33 @@ def screen_title(title: str, body: str) -> Optional[str]:
     return None
 
 
+def screen_title_for_clean(title: str, body: str) -> Optional[str]:
+    """clean split（负样本）的标题/正文淘汰判定，返回淘汰原因或 None（= 通过）。
+
+    与 screen_title 共用同一批"这不是一个 organic 普通改动"的拒绝分支
+    （backport/revert/发版/依赖升级/纯文档改动这些不该进任一 split），唯独对
+    FIX_KEYWORDS 的判定**取反**：screen_title 要求命中才通过（这是 bugfix PR
+    的判据），这里要求**不**命中才通过（负样本必须不像 bugfix）。
+
+    两个函数不合并成一个带 mode 参数的函数：合并后单一函数要靠一个布尔值
+    分叉整段逻辑，可读性和测试都更差；拆开各自是纯函数，离线单测互不影响，
+    改一条规则时也不用担心影响另一条 split 的判定。
+    """
+    if BACKPORT_PATTERN.search(title or ""):
+        return "backport-duplicate"
+    if EXCLUDE_KEYWORDS.search(title or ""):
+        return "excluded-keyword"
+    if RELEASE_TITLE.match(title or ""):
+        return "release-commit"
+    if DEPENDENCY_UPGRADE.search(title or ""):
+        return "excluded-keyword"
+    if SUBJECT_ONLY_PREFIX.search(title or ""):
+        return "excluded-keyword"
+    if FIX_KEYWORDS.search("%s\n%s" % (title or "", body or "")):
+        return "looks-like-a-bugfix"
+    return None
+
+
 def build_case(
     pull: PullRequest, split: str, cutoff: str, domain: str = "",
 ) -> dict:
@@ -897,6 +929,117 @@ def build_case(
     }
 
 
+def build_clean_case(
+    pull: PullRequest, split: str, cutoff: str, as_of: datetime, domain: str = "",
+) -> dict:
+    """Build a clean (negative) case from an ordinary merged PR, or raise CaseRejected.
+
+    对称于 build_case，但不反转 diff——直接用 PR 原始 diff 里筛过的
+    code_chunks 拼成待审内容，`expected_findings = []`。
+
+    为什么需要这条路径：build_case 构造的每条 case 都保证附近有一个已验证的
+    真实缺陷，reviewer 在这批数据上的高命中率测的是"在已知缺陷位置上会不会
+    漏报"，测不出假阳性率。这里采一批"看起来不像 bugfix 的普通已合并 PR"
+    当负样本，让 clean_accuracy（≈ 1-FPR）第一次在真实数据上有意义。
+
+    `cutoff` 和 `as_of` 是两个不同的时间基准，不要合并成一个参数：`cutoff`
+    是模型知识截止日期，只用来算 `contamination_split`（跟 build_case 的
+    用法完全一致）；`as_of` 是采集发生的时刻，只用来算冷却期是否已过。
+    两者在调用方那里数值上常常不同（cutoff 是固定配置，as_of 接近当前
+    时间），概念上更是完全不同的东西，混用会让 contamination_split 的
+    含义变得不可预测。
+
+    `as_of` 由调用方传入，不在函数内部取当前时间——保持这个模块纯函数、
+    可离线测试（同一个 pull + 同一个 as_of 必须永远产出同一个结果）。
+    """
+    title = pull.title or ""
+    body = pull.body or ""
+
+    screened = screen_title_for_clean(title, body)
+    if screened is not None:
+        raise CaseRejected(screened, title[:80])
+
+    merged_at = _parse_iso(pull.merged_at)
+    if (as_of - merged_at).days < CLEAN_COOLDOWN_DAYS:
+        raise CaseRejected("cooldown-not-elapsed", pull.merged_at)
+
+    diff = pull.diff or ""
+    if not diff.strip():
+        raise CaseRejected("empty-diff")
+
+    chunks = split_diff_by_file(diff)
+    if not chunks:
+        raise CaseRejected("unparsable-diff")
+
+    # 与 build_case 相同：只保留非测试 .py 的文件块，测试文件的改动不该
+    # 进入待审 diff。
+    code_chunks = [
+        (path, text) for path, text in chunks
+        if path.endswith(".py") and not is_test_path(path)
+    ]
+
+    used = "".join(text for _path, text in code_chunks)
+    for marker in UNSUPPORTED_MARKERS:
+        if marker in used:
+            raise CaseRejected("unsupported-diff", marker.strip())
+    if NO_NEWLINE in used:
+        raise CaseRejected("unsupported-diff", "no-newline-marker")
+
+    if len(code_chunks) > MAX_FIX_FILES:
+        raise CaseRejected("too-many-files", str(len(code_chunks)))
+    if count_changed_lines(used) > MAX_FIX_LINES:
+        raise CaseRejected("too-many-lines", str(count_changed_lines(used)))
+    if not code_chunks:
+        raise CaseRejected("no-production-python")
+
+    # 不反转——直接用原始 diff 作为待审内容。validate_case 仍要求
+    # parsed.added_lines 非空（这是 evaluation_harness 的硬约束，不是这里
+    # 新加的），所以这条检查照样保留。
+    code_diff = "".join(text for _path, text in code_chunks)
+    parsed = parse_unified_diff(code_diff)
+    if not parsed.files or not parsed.added_lines:
+        raise CaseRejected("no-added-lines")
+
+    owner_repo = pull.repository.replace("/", "__")
+    return {
+        # ── validate_case 要求的字段 ──
+        "id": "%s-pr-%d-clean" % (owner_repo, pull.number),
+        "repository": pull.repository,
+        "pull_request": pull.number,
+        "split": split,
+        "diff": code_diff,
+        "expected_findings": [],
+        # ── 本数据集额外字段（尽量与 build_case 同构，便于下游统一处理）──
+        "merged_at": pull.merged_at,
+        "contamination_split": contamination_split(pull.merged_at, cutoff),
+        "difficulty": None,
+        "defect_class": None,
+        "defect_class_basis": None,
+        "rule_covered": None,
+        "domain": domain,
+        "label_provenance": None,
+        "fix_pr_url": pull.html_url or "https://github.com/%s/pull/%d" % (
+            pull.repository, pull.number,
+        ),
+        "fix_pr_title": title[:200],
+        # 空字符串而不是删掉这个字段：下游若对 human_patch 的字段存在性做
+        # 了假设，删字段的影响面比留空更大更难查。这里没有修复可言，
+        # 所以置空。
+        "human_patch": "",
+        "source": {
+            "kind": "real-pr-clean",
+            "note": (
+                "Absence of a known defect is a proxy signal (merged_at is at "
+                "least %d days before collection and no bugfix-looking follow-up "
+                "was observed), not a verified guarantee of correctness. This is "
+                "NOT the same claim as 'this code has no bugs' — it is 'no defect "
+                "was reported against it within the observation window'."
+                % CLEAN_COOLDOWN_DAYS
+            ),
+        },
+    }
+
+
 # ── 七、配额与覆盖复核 ──────────────────────────────────────────────────
 
 
@@ -910,6 +1053,11 @@ class CoverageReport:
     by_repository: Dict[str, int] = field(default_factory=dict)
     by_provenance: Dict[str, int] = field(default_factory=dict)
     by_class_basis: Dict[str, int] = field(default_factory=dict)
+    # real-pr-reverted-fix（正样本）vs real-pr-clean（负样本）各多少条。
+    # 单独开一个字段而不是塞进 by_class/by_provenance：那两个字段的取值
+    # 空间是缺陷分类/标注来源，混进 source.kind 会让"某类只有 6 条"这种
+    # 告警把正负样本的计数混在一起判断，失去意义。
+    by_source_kind: Dict[str, int] = field(default_factory=dict)
     rejections: Dict[str, int] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -952,6 +1100,8 @@ def summarise(cases: Iterable[dict], rejections: Optional[Dict[str, int]] = None
         ):
             value = str(case.get(key, "unknown"))
             bucket[value] = bucket.get(value, 0) + 1
+        source_kind = str((case.get("source") or {}).get("kind", "unknown"))
+        report.by_source_kind[source_kind] = report.by_source_kind.get(source_kind, 0) + 1
 
     # 兜底类别占比要单独告警，而且要放在类别不足的告警**之前**报。
     #

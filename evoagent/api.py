@@ -451,6 +451,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(201, result)
                 return
+            if path == "/v1/deployments/llm-review/promote":
+                # 影子证据的出口。在这之前判决只能靠 auto_promote 那个开关，
+                # 而打开它等于让分歧率独自决定上线。这个端点是显式的、三态的、
+                # 带理由的：不满足条件时不写库，直接回 200 说明缺什么。
+                principal = self._principal("manage")
+                skill_name = str(
+                    self._read_json(body).get("skill_name", "llm-review"))
+                result = self.service.releases.evaluate_promotion(
+                    principal.tenant_id, skill_name
+                )
+                if result["promoted"]:
+                    self.service.reload_skills()
+                self.service.store.audit(
+                    principal.tenant_id, principal.username, "deployment.promote",
+                    skill_name,
+                    {"decision": result["decision"], "reason": result["reason"],
+                     "evidence": result["evidence"]},
+                )
+                self._send_json(200, result)
+                return
             if path == "/v1/queue/dead-letters/replay":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
@@ -479,6 +499,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 if result["decision"] == "activated":
                     self.service.reload_skills()
+                # 回放门禁通过 → 自动放上影子流量。在这之前 shadow_ready 是
+                # 死路：判决产出了，但没有任何代码消费它，候选要真上影子得有
+                # 人另外查版本号、手动 POST 一次部署配置。
+                #
+                # `stage_shadow` 自带守卫，不会覆盖一个正在累积证据的部署，
+                # 所以这里可以无条件调用。auto_promote 不从这里打开——影子
+                # 观测自动上线要人显式配置。
+                if result["decision"] == "shadow_ready" and result.get("version"):
+                    staging = self.service.releases.stage_shadow(
+                        principal.tenant_id, str(payload.get("skill_name", "llm-review")),
+                        int(result["version"]["version"]),
+                    )
+                    result["shadow_staging"] = staging
+                    self.service.store.audit(
+                        principal.tenant_id, principal.username,
+                        "deployment.shadow.auto_stage",
+                        str(payload.get("skill_name", "llm-review")),
+                        {"staged": staging["staged"], "reason": staging["reason"],
+                         "candidate_version": result["version"]["version"]},
+                    )
                 self._send_json(201, result)
                 return
             if path == "/v1/evolution/propose":

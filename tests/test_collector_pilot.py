@@ -189,7 +189,7 @@ class CollectStopsCleanlyTests(BudgetTestCase):
         self.transport.pulls = self._pulls()
         client = self._client(max_requests=2)
         # 不抛异常就是本条的断言：collect 必须自己收尾。
-        cases, rejections = collector.collect(client, self._plan(), "2024-07-01", 10)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 10)
         self.assertIsInstance(cases, list)
         self.assertIsInstance(rejections, dict)
         self.assertEqual(self.transport.calls, 2)
@@ -208,7 +208,7 @@ class CollectStopsCleanlyTests(BudgetTestCase):
         """
         self.transport.pulls = self._pulls(count=4)
         client = self._client(max_requests=6)
-        cases, rejections = collector.collect(client, self._plan(), "2024-07-01", 99)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 99)
         self.assertEqual(self.transport.calls, 6)
         last = self.transport.urls[-1]
         self.assertIn("/pulls?", last)   # 最后一次确实是 list
@@ -219,7 +219,7 @@ class CollectStopsCleanlyTests(BudgetTestCase):
         # 给足预算让前几个候选被淘汰并记账，再让预算在中途耗尽。
         self.transport.pulls = self._pulls(count=8)
         client = self._client(max_requests=4)
-        cases, rejections = collector.collect(client, self._plan(), "2024-07-01", 10)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 10)
         # 假 diff 不含合法 hunk，会被判 unsupported-diff，所以漏斗必然非空。
         self.assertTrue(rejections)
         self.assertEqual(sum(rejections.values()) > 0, True)

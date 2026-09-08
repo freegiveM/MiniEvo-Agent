@@ -53,7 +53,26 @@ class JsonChatClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
-            content = body["choices"][0]["message"]["content"]
+            choice = body["choices"][0]
+            content = choice["message"]["content"]
+            # 推理模型上 max_tokens 同时封顶 reasoning + content：预算被推理
+            # 吃完时 content 是空串，finish_reason 是 length。直接 json.loads("")
+            # 会报 "Expecting value: line 1 column 1"，把一个预算问题说成模型
+            # 返回了非法 JSON——照着那条消息去查 JSON 解析永远查不到病根。
+            if not (content or "").strip():
+                usage = body.get("usage") or {}
+                details = usage.get("completion_tokens_details") or {}
+                raise ValueError(
+                    "model returned empty content (finish_reason=%s, "
+                    "completion_tokens=%s, reasoning_tokens=%s, max_tokens=%s); "
+                    "raise the token budget for reasoning models"
+                    % (
+                        choice.get("finish_reason"),
+                        usage.get("completion_tokens"),
+                        details.get("reasoning_tokens"),
+                        max_tokens,
+                    )
+                )
             result = json.loads(content)
             if not isinstance(result, dict):
                 raise ValueError("model JSON root is not an object")

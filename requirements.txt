@@ -1,10 +1,45 @@
-# PyYAML 只被 scripts/collect_reverted_fix_dataset.py 用到（读仓库清单）。
-# 之所以不改用 JSON：清单需要逐仓库写"为什么选它"的注释，JSON 不支持注释，
-# 而这些理由本身是数据集设计的一部分，不该丢。脚本内延迟 import，
-# 运行服务不需要这个依赖。
+# 运行服务与跑测试所需的依赖。
+#
+# 这个文件曾经列着 6 个包，其中 4 个在本机根本没装、测试却全绿——因为它们
+# **全部是延迟 import**（`github.py:186` 的 jwt、`observability.py:16` 的
+# opentelemetry、`task_queue.py:40` 的 redis）。也就是说那份清单不是"运行
+# 需要什么"，而是"某些可选功能开启时需要什么"，两者混在一行里，结果是让
+# 每个 clone 的人为自己用不到的功能付安装代价。
+#
+# 更糟的是 `psycopg[binary]`：PostgreSQL 后端已经被删了，
+# `store.create_store` 现在对着 Postgres URL 直接抛 `NotImplementedError`
+# （理由见那个函数的 docstring）。装它换不回任何功能，却是这份清单里最
+# 容易装失败的一个——需要编译或匹配 wheel。让 quickstart 卡在一个已经
+# 不存在的功能上，是这份清单能犯的最坏的错。
+#
+# 现在的口径：这里只放**不装就跑不起来**的东西。可选功能各自一行，
+# 在下面注释里给出开启方式。
+
+# 核心运行时：无第三方依赖。
+#
+# HTTP 服务走标准库 `http.server`，存储走标准库 `sqlite3`，LLM 调用走
+# `urllib`。这一行不是偷懒，是刻意的——一个"clone 下来就能跑"的项目，
+# 依赖越少越可能真的跑起来。
+
+# 数据集采集脚本需要（`scripts/collect_reverted_fix_dataset.py` 读仓库
+# 清单）。之所以不改用 JSON：清单需要逐仓库写"为什么选它"的注释，JSON
+# 不支持注释，而这些理由本身是数据集设计的一部分，不该丢。脚本内延迟
+# import，只跑服务不需要它——但它足够小、装了不亏，所以留在核心里。
 PyYAML>=6,<7
-psycopg[binary]>=3.1,<4
-redis>=5,<7
-PyJWT[crypto]>=2.8,<3
-opentelemetry-sdk>=1.24,<2
-opentelemetry-exporter-otlp-proto-http>=1.24,<2
+
+
+# ---------------------------------------------------------------------------
+# 以下都是**可选**的。按需单独装，或者用 extras：
+#
+#     pip install -e ".[github]"        # GitHub App 认证（webhook 回写）
+#     pip install -e ".[queue]"         # Redis Streams 任务队列
+#     pip install -e ".[telemetry]"     # OTLP tracing
+#     pip install -e ".[all]"
+#
+# 不装时的行为在各自的代码里是**显式报错**，不是静默降级：
+#   - jwt 缺失          → github.py 抛错（只在配了 GitHub App 私钥时走到）
+#   - redis 缺失        → task_queue.py 抛 "Redis mode requires: pip install redis"
+#                         （不配 EVOAGENT_REDIS_URL 时用内存 ACK 队列，正常工作）
+#   - opentelemetry 缺失 → observability.py 静默关闭 tracing（这一个是降级，
+#                         但降级的是可观测性本身，不影响业务正确性）
+# ---------------------------------------------------------------------------

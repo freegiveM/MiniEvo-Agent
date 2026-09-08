@@ -9,12 +9,15 @@
 3. 覆盖复核的警告（不达标必须报，否则设计承诺变成没人核过的话）
 """
 import unittest
+from datetime import datetime, timezone
 
 from evoagent.dataset_builder import (
+    CLEAN_COOLDOWN_DAYS,
     MAX_FIX_LINES,
     CaseRejected,
     PullRequest,
     build_case,
+    build_clean_case,
     classify_defect,
     classify_defect_with_basis,
     contamination_split,
@@ -22,6 +25,7 @@ from evoagent.dataset_builder import (
     count_touched_functions,
     grade_difficulty,
     reverse_unified_diff,
+    screen_title_for_clean,
     split_diff_by_file,
     summarise,
 )
@@ -54,6 +58,20 @@ def _pull(diff, title="Fix weak hash in token computation", **kwargs):
     }
     defaults.update(kwargs)
     return PullRequest(**defaults)
+
+
+# 一个普通 feature PR 的 diff：新增一个函数，不涉及任何修复语义。
+# 用来喂 build_clean_case——负样本不该长得像 CRYPTO_FIX 那种反转专用素材。
+FEATURE_DIFF = """diff --git a/pkg/format.py b/pkg/format.py
+index 3333333..4444444 100644
+--- a/pkg/format.py
++++ b/pkg/format.py
+@@ -10,3 +10,6 @@ def render(value):
+     return str(value)
++
++def render_list(values):
++    return ", ".join(render(v) for v in values)
+"""
 
 
 class ReverseDiffTests(unittest.TestCase):
@@ -752,6 +770,103 @@ class CoverageReportTests(unittest.TestCase):
     def test_rejection_reasons_are_carried_through_for_the_funnel(self):
         report = summarise([self._case()], {"not-a-bugfix": 120, "too-many-lines": 30})
         self.assertEqual(120, report.rejections["not-a-bugfix"])
+
+
+class ScreenTitleForCleanTests(unittest.TestCase):
+    def test_an_ordinary_feature_title_passes(self):
+        self.assertIsNone(screen_title_for_clean("Add CSV export for reports", ""))
+
+    def test_a_title_that_looks_like_a_bugfix_is_rejected(self):
+        reason = screen_title_for_clean("Fix weak hash in token computation", "")
+        self.assertEqual("looks-like-a-bugfix", reason)
+
+    def test_fix_keywords_in_the_body_also_reject(self):
+        reason = screen_title_for_clean("Add CSV export", "This fixes a crash on empty input.")
+        self.assertEqual("looks-like-a-bugfix", reason)
+
+    def test_reverts_are_rejected_same_as_for_the_positive_split(self):
+        reason = screen_title_for_clean('Revert "use sha256 for tokens"', "")
+        self.assertEqual("excluded-keyword", reason)
+
+    def test_dependency_bumps_are_rejected(self):
+        reason = screen_title_for_clean("Bump requests from 2.30 to 2.31", "")
+        self.assertEqual("excluded-keyword", reason)
+
+    def test_release_titles_are_rejected(self):
+        reason = screen_title_for_clean("2.34.1", "")
+        self.assertEqual("release-commit", reason)
+
+
+class BuildCleanCaseTests(unittest.TestCase):
+    COOLDOWN_CLEARED = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    COOLDOWN_NOT_CLEARED = datetime(2025, 4, 1, tzinfo=timezone.utc)
+
+    def test_an_ordinary_feature_pr_becomes_a_clean_case_that_passes_validate_case(self):
+        case = build_clean_case(
+            _pull(FEATURE_DIFF, title="Add CSV export for reports"),
+            "validation", "2024-07-01", self.COOLDOWN_CLEARED, "reporting",
+        )
+        validate_case(case)
+        self.assertEqual([], case["expected_findings"])
+        self.assertEqual("real-pr-clean", case["source"]["kind"])
+        self.assertIsNone(case["difficulty"])
+        self.assertIsNone(case["defect_class"])
+        self.assertEqual("", case["human_patch"])
+        self.assertEqual("post-cutoff", case["contamination_split"])
+
+    def test_a_pr_still_inside_the_cooldown_window_is_rejected(self):
+        with self.assertRaises(CaseRejected) as ctx:
+            build_clean_case(
+                _pull(FEATURE_DIFF, title="Add CSV export for reports"),
+                "validation", "2024-07-01", self.COOLDOWN_NOT_CLEARED,
+            )
+        self.assertEqual("cooldown-not-elapsed", ctx.exception.reason)
+
+    def test_a_title_that_looks_like_a_bugfix_is_rejected(self):
+        with self.assertRaises(CaseRejected) as ctx:
+            build_clean_case(
+                _pull(FEATURE_DIFF, title="Fix weak hash in token computation"),
+                "validation", "2024-07-01", self.COOLDOWN_CLEARED,
+            )
+        self.assertEqual("looks-like-a-bugfix", ctx.exception.reason)
+
+    def test_the_cooldown_boundary_is_inclusive(self):
+        merged = datetime(2025, 3, 1, tzinfo=timezone.utc)
+        boundary_as_of = datetime(2025, 8, 28, tzinfo=timezone.utc)
+        self.assertGreaterEqual((boundary_as_of - merged).days, CLEAN_COOLDOWN_DAYS)
+        case = build_clean_case(
+            _pull(FEATURE_DIFF, title="Add CSV export for reports"),
+            "validation", "2024-07-01", boundary_as_of,
+        )
+        self.assertEqual([], case["expected_findings"])
+
+
+class CleanSplitFingerprintDedupTests(unittest.TestCase):
+    """跨 split 的指纹去重：同一个 PR 号不能同时进正负样本。
+
+    dataset_builder 本身不做跨调用的去重（那是采集脚本翻页时的职责），
+    这里只锁住"同一个 PR 能同时喂出一条正样本和一条负样本"这个事实——
+    去重必须在更上层按 (repository, pull_request) 做，不能指望这两个
+    构造函数互相感知对方。
+    """
+
+    def test_the_same_pr_can_independently_satisfy_both_builders(self):
+        # 这条测试记录的是当前事实（两个函数互不感知），不是期望行为；
+        # 它的作用是提醒：调用方（采集脚本）必须在两条路径之间按
+        # (repository, pull_request) 去重，否则同一个 PR 号会同时出现
+        # 在正负样本里。
+        fix_pull = _pull(CRYPTO_FIX, title="Fix weak hash in token computation")
+        positive = build_case(fix_pull, "validation", "2024-07-01")
+        feature_pull = _pull(
+            FEATURE_DIFF, title="Add CSV export for reports",
+            number=fix_pull.number, repository=fix_pull.repository,
+        )
+        clean = build_clean_case(
+            feature_pull, "validation", "2024-07-01",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual(positive["pull_request"], clean["pull_request"])
+        self.assertEqual(positive["repository"], clean["repository"])
 
 
 if __name__ == "__main__":

@@ -100,6 +100,45 @@ class Settings:
     openrouter_api_key: str = ""
     openrouter_site_url: str = ""
     openrouter_app_name: str = "EvoAgent"
+    # PR 合并/关闭事件推断出的反馈。默认关闭：推断信号的置信度低于人工
+    # 确认，静默开启会让一条"PR 合并了"被当成"人类确认这条报告是对的"。
+    infer_feedback_from_merge: bool = False
+    # 一个根因指纹要出现几次才够格触发候选生成 + 全量回放。低于这个数
+    # 只写记忆，不发起那几十次 LLM 调用。
+    #
+    # 默认 1 = 行为与本改动之前一致（任何一条反馈都触发）。刻意不默认成
+    # 3：那会静默改变现有部署的行为，让原本能触发的反馈突然不触发，而
+    # 使用者没做过这个选择。真实失败频率分布要跑一段数据才知道，阈值该
+    # 由观察决定，不由我猜。
+    #
+    # 轨道 F 的 val 晋升条件复用同一个值——"多次出现"在这个项目里只能
+    # 有一个标准。
+    evolution_root_cause_min_occurrences: int = 1
+    # 同一个根因指纹最多被尝试几次。反复尝试反复失败说明"改提示词"对这
+    # 类根因无效，不该无限重试烧钱。0 = 不限制。
+    evolution_max_attempts_per_root_cause: int = 3
+    # 下一轮从哪个提示词版本改起。"active" | "best" | "pareto" |
+    # "epsilon_greedy"，见 evoagent/archive.py。
+    #
+    # 默认 "active" = 行为与档案选亲加入之前完全一致。刻意不默认成
+    # "pareto"：当前 validation 区间宽度 0.15-0.17，"档案里哪个版本更好"
+    # 这个判断本身噪声就比策略之间的差异大，激进选亲很可能只是在噪声里
+    # 随机游走，却让人以为在做搜索。基建先就位，切策略等有数据支撑。
+    evolution_parent_strategy: str = "active"
+    # epsilon_greedy 的探索概率。仅该策略下生效。
+    evolution_parent_epsilon: float = 0.1
+    # 候选生成那一次 LLM 调用的 max_tokens。
+    #
+    # 默认从 6000 抬到 16000：**在推理模型上 6000 根本跑不完一次候选生成**。
+    # `max_tokens` 同时封顶 reasoning + content，deepseek-v4-flash 实测把
+    # 6000 全部花在推理上（`finish_reason=length`、`reasoning_tokens=6000`、
+    # `content=''`），一条候选都产不出来。第 16.5 节修的是这个错误的**报错
+    # 文案**（原来报成"模型返回了非法 JSON"），预算本身没动，于是回路 A 至今
+    # 一次都没真跑起来过。
+    #
+    # 抬高的代价是单轮成本上升，但产不出候选的调用是纯浪费——它同样按
+    # 6000 token 计费，只是什么都没换回来。
+    evolution_generator_token_budget: int = 16000
     eval_max_cases: int = 5
     eval_min_cases: int = 3
     eval_min_improvement: float = 0.01
@@ -219,6 +258,14 @@ class Settings:
             raise ValueError("EVOAGENT_EVAL_MIN_HOLDOUT_CASES cannot exceed EVOAGENT_EVAL_MAX_CASES")
         if not 0.0 <= self.eval_max_metric_regression <= 1.0:
             raise ValueError("EVOAGENT_EVAL_MAX_METRIC_REGRESSION must be between 0 and 1")
+        # 下限取 2000 而不是 1：推理模型上预算不足的表现是"content 空串 +
+        # finish_reason=length"，一次调用照常计费却产不出候选。配一个装不下
+        # 一次生成的预算，等于让回路静默停在这里——那与第 16.6 节那个假装在
+        # 工作的门禁是同一种毛病。
+        if self.evolution_generator_token_budget < 2000:
+            raise ValueError(
+                "EVOAGENT_EVOLUTION_GENERATOR_TOKEN_BUDGET must be at least 2000"
+            )
         if self.auth_required and len(self.auth_secret.encode("utf-8")) < 32:
             raise ValueError(
                 "EVOAGENT_AUTH_SECRET must contain at least 32 bytes when authentication is enabled"
@@ -290,6 +337,17 @@ class Settings:
             openrouter_api_key=os.getenv("EVOAGENT_OPENROUTER_API_KEY", ""),
             openrouter_site_url=os.getenv("EVOAGENT_OPENROUTER_SITE_URL", ""),
             openrouter_app_name=os.getenv("EVOAGENT_OPENROUTER_APP_NAME", "EvoAgent"),
+            infer_feedback_from_merge=_bool("EVOAGENT_INFER_FEEDBACK_FROM_MERGE", False),
+            evolution_root_cause_min_occurrences=_int(
+                "EVOAGENT_EVOLUTION_ROOT_CAUSE_MIN_OCCURRENCES", 1),
+            evolution_max_attempts_per_root_cause=_non_negative_int(
+                "EVOAGENT_EVOLUTION_MAX_ATTEMPTS_PER_ROOT_CAUSE", 3),
+            evolution_parent_strategy=os.getenv(
+                "EVOAGENT_EVOLUTION_PARENT_STRATEGY", "active").strip() or "active",
+            evolution_parent_epsilon=float(
+                os.getenv("EVOAGENT_EVOLUTION_PARENT_EPSILON", "0.1")),
+            evolution_generator_token_budget=_int(
+                "EVOAGENT_EVOLUTION_GENERATOR_TOKEN_BUDGET", 16000),
             eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 5),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),

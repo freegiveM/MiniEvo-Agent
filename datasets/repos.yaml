@@ -8,6 +8,17 @@
 # 公开缺陷历史特征，不是已验证的事实。采集跑完后必须用实际产出复核，
 # 若某类不足则调整 target_prs 或补充仓库。清单不是结论，是采样计划。
 # ────────────────────────────────────────────────────────────────────────
+#
+# ── clean_target_prs（负样本配额，2026-09 新增）───────────────────────
+# 每条仓库新增 clean_target_prs 字段：从同一批仓库里再采一批"看起来不像
+# bugfix 的普通已合并 PR"作为负样本（expected_findings=[]），见
+# dataset_builder.build_clean_case 与 README.md"八、Clean split（负样本）"
+# 一节。默认给正样本配额的 1 倍——这仍然是**先验值**，不是已验证的可行
+# 产出量：负样本要额外过 CLEAN_COOLDOWN_DAYS（180 天）冷却期这一条正样本
+# 没有的约束，实际能采到多少要等 --pilot 跑完才知道，不能假设 1:1 一定
+# 能凑满。默认不采（scripts 侧 --clean-target 默认 0），避免在没有明确
+# 要求时改变现有 real-pr-v1.jsonl 的产出形状。
+# ────────────────────────────────────────────────────────────────────────
 
 version: 1
 
@@ -22,6 +33,12 @@ cutoff: "2024-07-01"
 # 采集配额。故意超采：筛选规则会淘汰大部分候选，target_prs 是"想要的成品数"，
 # 采集器会按需翻更多页。
 target_total: 100
+
+# 负样本总配额（见上面 clean_target_prs 的说明）。这是信息性的参考值，
+# 采集器不会自动读它：负样本路径必须靠命令行 --clean-target 显式打开，
+# 不传就保持不采，即使这里写了非零值——见 scripts/collect_reverted_fix_dataset.py
+# 里 --clean-target 的 help 文案。
+clean_target_total: 100
 
 defaults:
   # 每仓库最多翻多少页已合并 PR（每页 100 条）。防止在低产仓库上无限翻页。
@@ -47,6 +64,7 @@ repos:
     difficulty_tendency: [L2, L3, L4]
     test_cost: medium
     target_prs: 8
+    clean_target_prs: 8
 
   - name: tornadoweb/tornado
     split: validation
@@ -58,6 +76,7 @@ repos:
     difficulty_tendency: [L3, L4]
     test_cost: low
     target_prs: 6
+    clean_target_prs: 6
 
   - name: encode/httpx
     split: validation
@@ -69,6 +88,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: low
     target_prs: 7
+    clean_target_prs: 7
 
   - name: urllib3/urllib3
     split: validation
@@ -80,6 +100,7 @@ repos:
     difficulty_tendency: [L1, L2, L3]
     test_cost: low
     target_prs: 7
+    clean_target_prs: 7
 
   # ── 任务队列 / 分布式：状态机与竞态 ──────────────────────────────────
   - name: celery/celery
@@ -92,6 +113,7 @@ repos:
     difficulty_tendency: [L3, L4]
     test_cost: medium
     target_prs: 7
+    clean_target_prs: 7
 
   - name: dask/dask
     split: validation
@@ -103,6 +125,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: high
     target_prs: 6
+    clean_target_prs: 6
 
   # ── 数据校验 / 序列化：边界与解析 ────────────────────────────────────
   - name: pydantic/pydantic
@@ -115,6 +138,7 @@ repos:
     difficulty_tendency: [L1, L2]
     test_cost: low
     target_prs: 6
+    clean_target_prs: 6
 
   # ── 运维工具：注入与凭据暴露 ────────────────────────────────────────
   - name: ansible/ansible
@@ -128,6 +152,7 @@ repos:
     difficulty_tendency: [L1, L2]
     test_cost: high
     target_prs: 7
+    clean_target_prs: 7
 
   # ── 加密 / 远程访问：弱算法与认证 ───────────────────────────────────
   - name: paramiko/paramiko
@@ -140,6 +165,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: low
     target_prs: 6
+    clean_target_prs: 6
 
   - name: mitmproxy/mitmproxy
     split: validation
@@ -151,6 +177,7 @@ repos:
     difficulty_tendency: [L3, L4]
     test_cost: medium
     target_prs: 6
+    clean_target_prs: 6
 
   - name: python-pillow/Pillow
     split: validation
@@ -163,6 +190,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: medium
     target_prs: 5
+    clean_target_prs: 5
 
   # ════════════════════════════════════════════════════════════════════
   # Holdout 仓库（约 30% PR）
@@ -187,6 +215,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: high
     target_prs: 7
+    clean_target_prs: 7
 
   - name: apache/airflow
     split: holdout
@@ -198,6 +227,7 @@ repos:
     difficulty_tendency: [L3, L4]
     test_cost: high
     target_prs: 7
+    clean_target_prs: 7
 
   - name: psf/requests
     split: holdout
@@ -210,6 +240,7 @@ repos:
     difficulty_tendency: [L1, L2]
     test_cost: low
     target_prs: 5
+    clean_target_prs: 5
 
   - name: PyCQA/bandit
     split: holdout
@@ -222,6 +253,7 @@ repos:
     difficulty_tendency: [L1, L2]
     test_cost: low
     target_prs: 5
+    clean_target_prs: 5
 
   - name: pallets/jinja
     split: holdout
@@ -233,6 +265,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: low
     target_prs: 5
+    clean_target_prs: 5
 
 # ══════════════════════════════════════════════════════════════════════
 # 采集后复核（2026-09，95 条产出。上面的 expect_classes /

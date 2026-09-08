@@ -36,6 +36,11 @@ class _ClosingConnection:
 
 
 class TaskStore:
+    #: `select_evaluation_cases` 里干净样本占单次取样的份额上限。
+    #: 见该方法 "## 为什么还要一个份额上限" 一节：库内比例反映的是"哪种
+    #: 样本便宜"，不是线上的真实缺陷率。
+    max_clean_share = 0.5
+
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.Lock()
@@ -134,6 +139,42 @@ class TaskStore:
                     metrics_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )"""
+            )
+            conn.execute(
+                # 消费账本：哪条 failure_case 在哪次 run 里被喂给过生成器，
+                # 以及那次 run 的判决。
+                #
+                # 为什么需要它，而不是复用 failure_cases.resolved：
+                # `resolved` 的语义是"这条反馈处理完了"，只在候选**激活**时
+                # 置位（evolution.py 的 auto_propose 尾部）。但 LLM 路径固定
+                # 走 activation_policy="shadow"，decision 永远是 shadow_ready
+                # 而不是 activated——于是 resolved 永远不置位，同一批 case
+                # 每轮重新喂一次，靠"候选提示词与上一版逐字相同"这个字符串
+                # 检查兜底，第二轮开始固定返回"没有新信号"。闭环停在原地。
+                #
+                # 把"试过了"和"解决了"分成两张账：试过 ≠ 解决。一条被拒的
+                # 候选说明这条反馈**已经被尝试过且失败了**，它不该在下一轮
+                # 被当成新信号重新触发一次全量回放（几十次 LLM 调用），但它
+                # 也没有被解决，仍然应该留在待分诊列表里。
+                """CREATE TABLE IF NOT EXISTS evolution_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    skill_name TEXT NOT NULL,
+                    failure_case_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    candidate_version INTEGER,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evolution_attempts_case "
+                "ON evolution_attempts(failure_case_id, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evolution_attempts_fingerprint "
+                "ON evolution_attempts(skill_name, fingerprint, created_at)"
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS skill_artifact_versions (
@@ -297,6 +338,24 @@ class TaskStore:
                     candidate_failed INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 )"""
+            )
+            # 影子观测必须能归属到具体候选版本。`save_deployment` 只把
+            # deployments 上的计数器清零，release_observations 的历史行是留着
+            # 的——没有这一列，换一个候选之后上一个候选的观测会被算进新候选
+            # 的晋升证据里，而且从报告上完全看不出来。旧行是 NULL：无法归属
+            # 的证据不计入，不猜。
+            self._ensure_column(
+                conn, "release_observations", "candidate_version", "INTEGER"
+            )
+            # 分歧的**方向**。对称分歧率分不出"候选多报了"和"候选漏掉了
+            # 基线报过的"，而这两者风险相反：前者可能是候选更强（也可能是
+            # 误报），后者是能力退化。只存一个对称标量，晋升判决就没有任何
+            # 依据区分它们。
+            self._ensure_column(
+                conn, "release_observations", "candidate_only", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                conn, "release_observations", "primary_only", "INTEGER NOT NULL DEFAULT 0"
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS alerts (
@@ -511,6 +570,52 @@ class TaskStore:
                 ).fetchall()
         return [dict(item) for item in rows]
 
+    def find_latest_review_task(
+        self, repository: str, pull_request: int, tenant_id: Optional[str] = None,
+        state: str = "SUCCESS",
+    ) -> Optional[Dict[str, Any]]:
+        """找这个 PR 最近一次成功的审查任务。
+
+        用于把 PR 关闭/合并事件接回它当初的审查报告。取**最近一次**而不是
+        全部：`synchronize` 会为同一个 PR 反复建任务，早先几轮审的是已经
+        被后续 commit 改掉的代码，拿它们推断"报告对不对"是错的。
+
+        state 默认 SUCCESS——失败的任务没有报告可比对。
+        """
+        query = (
+            "SELECT id FROM tasks WHERE repository=? AND pull_request=? AND state=?"
+        )
+        params: list = [repository, pull_request, state]
+        if tenant_id is not None:
+            query += " AND tenant_id=?"
+            params.append(tenant_id)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        if row is None:
+            return None
+        return self.get(row["id"], tenant_id)
+
+    def count_failure_cases_by_category(
+        self, tenant_id: Optional[str] = None, unresolved_only: bool = False,
+    ) -> Dict[str, int]:
+        """按 category 计数。用于报数时把推断来源与人工来源分开看。"""
+        query = "SELECT f.category AS category, COUNT(*) AS n FROM failure_cases f"
+        params: list = []
+        clauses = []
+        if tenant_id is not None:
+            query += " JOIN tasks t ON t.id=f.task_id"
+            clauses.append("t.tenant_id = ?")
+            params.append(tenant_id)
+        if unresolved_only:
+            clauses.append("f.resolved = 0")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " GROUP BY f.category"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return {item["category"]: int(item["n"]) for item in rows}
+
     def record_failure_case(self, task_id: str, category: str, payload: Dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -635,6 +740,206 @@ class TaskStore:
             values.append(value)
         return values
 
+    def select_evaluation_cases(
+        self, split: Optional[str] = None, active_only: bool = True,
+        limit: int = 100,
+    ) -> list:
+        """按"带缺陷 / 干净"分层取样，而不是 `ORDER BY id LIMIT n`。
+
+        ## 为什么必须分层
+
+        `list_evaluation_cases` 按 id 截断。`evaluation_cases` 里干净样本
+        （`expected_json = '[]'`）是后灌进去的，id 必然排在已有正样本之后，
+        于是 `LIMIT 5` 永远取不到它们——**把 78 条 clean 语料入库，
+        `clean_cases` 依然会是 0**。实测过：库里 id 24/25 本来就是干净样本，
+        而 `_propose` 拿到的 5 条全是 id 1-5 的缺陷样本。
+
+        `clean_accuracy`（≈ 1 − FPR）在打分公式里占权重 0.20，且
+        `_protected_metrics` 只在 `baseline["clean_cases"] > 0` 时才把它列为
+        受保护指标。分母为 0 时这两处一起失效：**进化回路只能看见"漏报变少
+        了没"，看不见"误报变多了没"**，于是候选可以靠多报把 recall 顶上去
+        而不受惩罚。实测的第一轮候选正是这个形状：recall 0.6 → 0.8，代价是
+        predicted_findings 7 → 9。
+
+        ## 取样口径
+
+        两层各按 id 升序取（**不随机**）：评测集变了要能解释成"库里内容变了"，
+        而不是"这次抽样抽到了别的"。`_propose` 会把
+        `validation_dataset_fingerprint` 落盘，随机取样会让同一个库连续两轮
+        的指纹不同，指纹就失去意义了。
+
+        名额按两层的实际存量比例分配，但每一层只要非空就至少保 1 条：
+        比例分配在 `limit` 很小时会把少数层直接抹成 0（5 × 78/173 = 2.25，
+        向下取整还行，但 3 × 20/173 = 0.34 → 0），而少一层就等于那道门禁
+        无声失效——这正是要修的毛病本身。
+
+        ## 为什么还要一个份额上限
+
+        库内比例反映的**不是线上真实缺陷率，而是"哪种样本便宜"**：干净 PR
+        可以批量抓（`real-pr-clean-v1.jsonl` 有 78 条），人工确认过的缺陷
+        样本很贵（20 条）。纯按比例取样时 `limit=20` 会取出 4 条缺陷 + 15 条
+        干净，recall 的步长变成 0.25，precision/recall 退化成噪声——**那等于
+        用"补上误报侧的分母"换掉了漏报侧的分母**，两头都量不准。
+
+        所以干净层另受 `max_clean_share`（0.5）约束。代价是缺陷层取完后
+        返回条数会少于 `limit`（20 缺陷 + 78 干净、`limit=98` 时只返回 62
+        条）：**这是诚实结果，不是缺陷**。硬凑到 `limit` 只能靠突破上限，
+        那会把测出来的分数重新变成干净样本的分数。
+
+        `limit=1` 时两层各留 1 条必然超限，退回旧口径——1 条的评测集本来
+        就量不出两个方向。
+        """
+        clauses = []
+        params: List[Any] = []
+        if split:
+            clauses.append("split = ?")
+            params.append(split)
+        if active_only:
+            clauses.append("active = 1")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        limit = max(1, min(limit, 500))
+
+        def fetch(extra: str) -> list:
+            query = "SELECT * FROM evaluation_cases" + where
+            query += (" AND " if clauses else " WHERE ") + extra
+            query += " ORDER BY id"
+            with self._connect() as conn:
+                return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+        # "干净"的判定必须和 `_score` 里的 `int(not expected_items)` 对齐：
+        # 那边看的是反序列化后的空列表，这里只能看存储形态。两者一致的前提是
+        # `expected_json` 恒为合法 JSON——由 schema 的 NOT NULL 加
+        # `save_evaluation_case` 的 `json.dumps` 共同保证。
+        #
+        # 刻意**不**在这里加 `IS NULL OR TRIM(...) = ''` 之类的兜底：那种行
+        # 会在 hydration 的 `json.loads` 就崩掉（两条取样路径都一样），根本
+        # 走不到分层判定，兜底分支只会看起来在防守而实际永不生效。要防就在
+        # 写入侧防。见 test_a_corrupt_expected_json_fails_the_same_way_on_both_paths。
+        positive = fetch("expected_json != '[]'")
+        clean = fetch("expected_json = '[]'")
+        if not positive:
+            # 没有缺陷层时两级分层都无从谈起，退回原口径，行为逐字节不变。
+            return self.list_evaluation_cases(split, active_only, limit)
+        if not clean:
+            # 干净层为空时"缺陷 / 干净"这一级没得分，但**严重度那一级仍然
+            # 要分**。两级管的是两个互相独立的分母：外层给 `clean_accuracy`，
+            # 内层给 `high_severity_recall`。在这里一并退回平铺截断，等于让
+            # 后者的分母重新取决于"库里有没有干净样本"——一个与严重度毫无
+            # 关系的条件。holdout 就差点栽在这上面：缺陷条数涨到 110，
+            # 高危分母在 limit=20 下仍然是 1。
+            return self._hydrate(self._take_positive(positive, limit))
+        if limit < 2:
+            # 预算只有 1 条时两层各留 1 条必然超限，而超限比少一层更糟：
+            # limit 是调用方给的预算，不是建议值。1 条的评测集本来就量不出
+            # 误报/漏报两个方向，这里退回旧口径而不是偷偷返回 2 条。
+            return self.list_evaluation_cases(split, active_only, limit)
+
+        total = len(positive) + len(clean)
+        if limit >= total:
+            # 预算够装下整张表时没有任何取舍要做，全给。
+            #
+            # 这一支是必须的：份额上限的职责是**分配稀缺预算**，不是删减语料。
+            # 少了它，调用方明明要"全部 20 条"却拿到 12 条，
+            # `holdout_dataset_ready`（比较 len(cases) 与 min_holdout_cases）
+            # 就会失败——rejection_proof 正是这么被打断的，它按
+            # `max_cases=len(cases)` 请求全集。取样在这种情形下悄悄丢掉 8 条，
+            # 等于对数据集规模说谎。
+            return self.list_evaluation_cases(split, active_only, limit)
+
+        # 名额按存量比例分配，但干净层的份额另设上限。
+        #
+        # 库内比例反映的**不是线上真实缺陷率，而是"哪种样本便宜"**：干净 PR
+        # 可以批量抓（78 条），人工确认过的缺陷样本很贵（20 条）。纯按比例时
+        # limit=20 会取出 4 缺陷 + 15 干净，recall 的步长变成 0.25，
+        # precision/recall 退化成噪声——那等于用"补上误报侧的分母"换掉了
+        # 漏报侧的分母，两头都量不准。
+        share = min(len(clean) / total, self.max_clean_share)
+        clean_quota = max(1, min(len(clean), int(limit * share)))
+        positive_quota = max(1, min(len(positive), limit - clean_quota))
+        # 干净层不得超过**实际取到的**缺陷条数。按预算的一半算上限在缺陷层
+        # 存量不足时会失效（20 缺陷 + 78 干净、limit=98 时取出 20 缺陷 +
+        # 49 干净，71% 干净），而那正是这个上限本该拦住的形态。
+        clean_quota = min(clean_quota, positive_quota)
+
+        return self._hydrate(
+            self._take_positive(positive, positive_quota) + clean[:clean_quota]
+        )
+
+    @staticmethod
+    def _hydrate(selected: list) -> list:
+        """按 id 排序并反序列化，口径与 `list_evaluation_cases` 一致。
+
+        排序放在这里而不是各个取样分支里：分层取样天然打乱顺序（缺陷层
+        与干净层、普通与高危各自按 id 取，拼起来就不是全局有序了），而
+        `_propose` 的数据集指纹按返回顺序算。少排一次，同一套样本会因为
+        拼接次序不同而算出不同的指纹。
+        """
+        values = []
+        for row in sorted(selected, key=lambda item: item["id"]):
+            value = dict(row)
+            value["expected"] = json.loads(value.pop("expected_json"))
+            value["active"] = bool(value["active"])
+            values.append(value)
+        return values
+
+    #: `expected.min_severity` 落在这两档时算高危样本，与
+    #: `evaluation_harness` 里 `high_severity_recall` 的口径一致。
+    high_severities = ("high", "critical")
+
+    @staticmethod
+    def _has_high_severity(row: dict) -> bool:
+        """这条样本的期望里有没有 high/critical。
+
+        只能看存储形态（`expected_json` 还没反序列化）。解析失败不在这里
+        兜——坏行会在 hydration 的 `json.loads` 崩掉，两条取样路径一样，
+        在这里 try/except 只会把一个写入侧的缺陷藏起来。
+        """
+        for item in json.loads(row["expected_json"]):
+            if str(item.get("min_severity", "")).lower() in TaskStore.high_severities:
+                return True
+        return False
+
+    def _take_positive(self, positive: list, quota: int) -> list:
+        """在缺陷层内部再按严重度分层取。
+
+        ## 为什么缺陷层还要再分一层
+
+        这是干净样本那个毛病的**同形复发**，只是换了一个维度。补进 holdout
+        的高危样本 id 排在最后（实测 id 182-214，而缺陷层从 id 26 起），
+        `positive[:quota]` 按 id 截断时永远取不到它们：holdout 缺陷分母从
+        1 涨到 110 之后，`high_severity_denominator` 在 `limit=20` 下**仍然
+        是 1**。
+
+        后果和 `clean_accuracy` 那次一样，只是更隐蔽：
+        `high_severity_recall` 是 `_protected_metrics` 里**无条件**列入的
+        受保护指标（不像 `clean_accuracy` 有 `if baseline["clean_cases"]`
+        把关），分母为 0 时 `_metric_non_regressing` 按"本来没测过，无从
+        回退"放行，于是它恒通过。`_non_regression_report` 的
+        `unmeasurable` 会如实列出这一项——但那是报告，不是门禁。
+
+        分母为 1 比 0 更难发现：指标照常打印一个 0.0/1.0 的读数，看不出
+        它只有两档。
+
+        ## 取样口径
+
+        与外层完全一致：两层各按 id 升序取（不随机，指纹要能解释），
+        非空的层至少保 1 条，且高危层不超过实际取到的普通缺陷条数——
+        高危样本目前全部来自 `mutation-v1` 的 weakened-guard 单一算子，
+        让它占满缺陷层会把 recall 变成"对减弱守卫的敏感度"。
+        """
+        high = [row for row in positive if self._has_high_severity(row)]
+        rest = [row for row in positive if not self._has_high_severity(row)]
+        if not high or not rest or quota < 2:
+            # 只有一层、或预算装不下两层各 1 条时，退回原口径。
+            return positive[:quota]
+
+        high_quota = max(1, min(len(high), int(quota * len(high) / len(positive))))
+        rest_quota = max(1, min(len(rest), quota - high_quota))
+        # 高危层不得超过**实际取到的**普通缺陷条数，理由同 `max_clean_share`：
+        # 按预算算的上限在普通层存量不足时会失效。
+        high_quota = min(high_quota, rest_quota)
+        return rest[:rest_quota] + high[:high_quota]
+
     def save_evolution_run(self, run: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -648,11 +953,23 @@ class TaskStore:
             )
         return run
 
-    def list_evolution_runs(self, limit: int = 50) -> list:
+    def list_evolution_runs(
+        self, limit: int = 50, skill_name: Optional[str] = None,
+    ) -> list:
+        """按时间倒序列出评测记录。
+
+        `skill_name` 是可选过滤，默认 None = 全部，与本参数加入之前的行为
+        一致。档案构建（archive.py）必须传它：不同 skill 的版本号各自从 1
+        开始编号，不过滤的话 `llm-review` 的 v3 会跟另一个 skill 的 v3 撞
+        在一起，逐样本分数表被污染，而这种污染在报告里看不出来。
+        """
+        clause = " WHERE skill_name = ?" if skill_name else ""
+        params: tuple = (skill_name,) if skill_name else ()
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM evolution_runs ORDER BY created_at DESC LIMIT ?",
-                (max(1, min(limit, 200)),),
+                "SELECT * FROM evolution_runs" + clause
+                + " ORDER BY created_at DESC LIMIT ?",
+                params + (max(1, min(limit, 200)),),
             ).fetchall()
         values = []
         for row in rows:
@@ -669,21 +986,101 @@ class TaskStore:
             )
             return cursor.rowcount == 1
 
-    def save_skill_version(self, skill_name: str, prompt: str, score: float, activate: bool = False) -> Dict[str, Any]:
+    def record_evolution_attempts(
+        self, run_id: str, skill_name: str, decision: str, reason: str,
+        candidate_version: Optional[int], cases: list,
+    ) -> int:
+        """记账：这批 failure_case 在这次 run 里被尝试过，判决是什么。
+
+        `cases` 是 (failure_case_id, fingerprint) 的序列。一次写入一批，
+        同一个事务——半批落盘会让下一轮把剩下那半当成"从未尝试过"。
+        """
+        rows = [
+            (run_id, skill_name, int(case_id), str(fingerprint), decision,
+             str(reason or "")[:1000], candidate_version, utc_now())
+            for case_id, fingerprint in cases
+        ]
+        if not rows:
+            return 0
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO evolution_attempts(run_id,skill_name,failure_case_id,"
+                "fingerprint,decision,reason,candidate_version,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                rows,
+            )
+        return len(rows)
+
+    def list_attempted_failure_case_ids(self, skill_name: str) -> set:
+        """已经被喂给过生成器的 failure_case id。
+
+        不按 decision 过滤：被拒的候选说明这条反馈**试过且失败了**，
+        它同样不该在下一轮被当成新信号重新触发一次全量回放。想重试的话
+        是一个显式动作（人工重开），不是默认行为。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT failure_case_id FROM evolution_attempts WHERE skill_name = ?",
+                (skill_name,),
+            ).fetchall()
+        return {int(row["failure_case_id"]) for row in rows}
+
+    def count_attempts_by_fingerprint(self, skill_name: str) -> Dict[str, int]:
+        """每个根因指纹被尝试过多少次（去重到 run 级）。
+
+        用于 DGM 式的选亲：一个反复尝试反复失败的根因，说明"改提示词"
+        这个动作对它无效，不该无限重试。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT fingerprint, COUNT(DISTINCT run_id) AS n FROM evolution_attempts "
+                "WHERE skill_name = ? GROUP BY fingerprint",
+                (skill_name,),
+            ).fetchall()
+        return {str(row["fingerprint"]): int(row["n"]) for row in rows}
+
+    def list_evolution_attempts(self, skill_name: str, limit: int = 200) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM evolution_attempts WHERE skill_name = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (skill_name, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_skill_version(
+        self, skill_name: str, prompt: str, score: float, activate: bool = False,
+        parent_version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """存一个新版本。
+
+        `parent_version` 显式传入时记它，否则回落到当前 active 版本——后者
+        是本参数加入之前的唯一行为。
+
+        为什么需要显式传：档案选亲（archive.py）之后，候选的基线可能不是
+        active 版本。仍然记 active 当亲本会让血统记录说谎，而 `parent_version`
+        是事后重建搜索路径的唯一依据——记错了，"这个提示词是从哪一支演化
+        来的"就永远查不回来了。
+        """
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS version FROM skill_versions WHERE skill_name = ?", (skill_name,)
             ).fetchone()
             version = int(row["version"]) + 1
-            parent = self.get_active_skill_version(skill_name)
+            if parent_version is None:
+                parent = self.get_active_skill_version(skill_name)
+                parent_version = parent["version"] if parent else None
             if activate:
                 conn.execute("UPDATE skill_versions SET active = 0 WHERE skill_name = ?", (skill_name,))
             conn.execute(
                 "INSERT INTO skill_versions(skill_name, version, prompt, score, active, parent_version, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (skill_name, version, prompt, score, int(activate), parent["version"] if parent else None, utc_now()),
+                (skill_name, version, prompt, score, int(activate), parent_version, utc_now()),
             )
-        return {"skill_name": skill_name, "version": version, "score": score, "active": activate}
+        return {
+            "skill_name": skill_name, "version": version, "score": score,
+            "active": activate, "parent_version": parent_version,
+        }
 
     def get_active_skill_version(self, skill_name: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -1119,16 +1516,27 @@ class TaskStore:
         self, tenant_id: str, skill_name: str, task_id: str, lane: str,
         primary: Dict[str, Any], candidate: Optional[Dict[str, Any]],
         disagreement: float, candidate_failed: bool = False,
+        candidate_only: int = 0, primary_only: int = 0,
     ) -> Optional[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
+            # candidate_version 从 deployments 现场读，不由调用方传入：调用方
+            # 传的话，一次参数错误就会把观测记到别的候选名下，而这正是这一列
+            # 要防的事。读不到部署时留 NULL（无法归属的证据不计入晋升）。
+            current = conn.execute(
+                "SELECT candidate_version FROM deployments WHERE tenant_id=? AND skill_name=?",
+                (tenant_id, skill_name),
+            ).fetchone()
             conn.execute(
                 "INSERT INTO release_observations(tenant_id,skill_name,task_id,lane,"
-                "primary_json,candidate_json,disagreement,candidate_failed,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "primary_json,candidate_json,disagreement,candidate_failed,created_at,"
+                "candidate_version,candidate_only,primary_only) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (tenant_id, skill_name, task_id, lane,
                  json.dumps(primary, ensure_ascii=False),
                  json.dumps(candidate, ensure_ascii=False) if candidate is not None else None,
-                 float(disagreement), int(candidate_failed), utc_now()),
+                 float(disagreement), int(candidate_failed), utc_now(),
+                 current["candidate_version"] if current else None,
+                 int(candidate_only), int(primary_only)),
             )
             conn.execute(
                 "UPDATE deployments SET shadow_samples=shadow_samples+1,"
@@ -1162,7 +1570,138 @@ class TaskStore:
                     (utc_now(), tenant_id, skill_name),
                 )
                 value["status"] = "promoted"
+                candidate_version = value.get("candidate_version")
+                # Keep skill_versions.active in sync with the deployment that is now
+                # actually serving traffic, so evolution.py's next baseline read
+                # (get_active_skill_version) does not diverge from production.
+                # Inlined (not a call to activate_skill_version) because self._lock
+                # is non-reentrant and is already held in this transaction.
+                if candidate_version is not None and conn.execute(
+                    "SELECT 1 FROM skill_versions WHERE skill_name = ? AND version = ?",
+                    (skill_name, candidate_version),
+                ).fetchone():
+                    conn.execute(
+                        "UPDATE skill_versions SET active = 0 WHERE skill_name = ?", (skill_name,)
+                    )
+                    conn.execute(
+                        "UPDATE skill_versions SET active = 1 WHERE skill_name = ? AND version = ?",
+                        (skill_name, candidate_version),
+                    )
         return value
+
+    def promote_deployment(
+        self, tenant_id: str, skill_name: str, candidate_version: int,
+    ) -> Optional[Dict[str, Any]]:
+        """把候选晋升为 stable，并同步 `skill_versions.active`。
+
+        用增量 UPDATE 而不是 `save_deployment`：后者会把
+        `samples/errors/shadow_samples/disagreements` 全部清零，晋升时清零
+        等于把刚刚用来做决定的那批证据擦掉，事后无法复核这次晋升凭什么发生。
+
+        `candidate_version` 必须与部署当前的候选一致才写——判决与写回之间
+        若有人换了候选，就会把 A 的证据用到 B 的晋升上。不一致时返回 None，
+        由调用方重新判决。
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM deployments WHERE tenant_id=? AND skill_name=?",
+                (tenant_id, skill_name),
+            ).fetchone()
+            if not row:
+                return None
+            value = dict(row)
+            if value["status"] != "running":
+                return None
+            if int(value["candidate_version"] or 0) != int(candidate_version):
+                return None
+            conn.execute(
+                "UPDATE deployments SET status='promoted',stable_version=candidate_version,"
+                "canary_percent=0,shadow_percent=0,updated_at=? "
+                "WHERE tenant_id=? AND skill_name=?",
+                (utc_now(), tenant_id, skill_name),
+            )
+            # 与生产实际服务的版本保持一致，否则 evolution.py 下一次读
+            # get_active_skill_version 拿到的基线与线上不是同一个东西。
+            # 内联而不是调用 activate_skill_version：self._lock 不可重入，
+            # 这里已经持有它了（与下方 auto_promote 分支同一原因）。
+            if conn.execute(
+                "SELECT 1 FROM skill_versions WHERE skill_name = ? AND version = ?",
+                (skill_name, int(candidate_version)),
+            ).fetchone():
+                conn.execute(
+                    "UPDATE skill_versions SET active = 0 WHERE skill_name = ?", (skill_name,)
+                )
+                conn.execute(
+                    "UPDATE skill_versions SET active = 1 WHERE skill_name = ? AND version = ?",
+                    (skill_name, int(candidate_version)),
+                )
+            updated = conn.execute(
+                "SELECT * FROM deployments WHERE tenant_id=? AND skill_name=?",
+                (tenant_id, skill_name),
+            ).fetchone()
+        return dict(updated) if updated else None
+
+    def summarise_shadow_evidence(
+        self, tenant_id: str, skill_name: str, candidate_version: int,
+    ) -> Dict[str, Any]:
+        """汇总**属于指定候选版本**的影子观测。
+
+        为什么按 candidate_version 过滤：`save_deployment` 只清零 deployments
+        上的计数器，release_observations 的历史行会留下来。不过滤的话，上一个
+        候选的观测会被算进这一个候选的晋升证据里，而报告上看不出来。
+
+        `candidate_version IS NULL` 的旧行（这一列加入之前写的）**不计入**——
+        无法归属的证据不能当成任何候选的证据。这会让老库的证据数看起来变少，
+        那是正确的：那些行本来就不知道属于谁。
+
+        计数口径：
+        - `candidate_only_total` / `primary_only_total` 是分歧的两个方向，
+          不能合成一个数（见 observe_shadow）；
+        - `candidate_wins` = 至少有一条候选独有发现的观测数；
+        - `candidate_losses` = 至少漏掉一条基线发现的观测数。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS samples,"
+                "SUM(candidate_failed) AS failures,"
+                "SUM(CASE WHEN disagreement > 0 THEN 1 ELSE 0 END) AS disagreements,"
+                "SUM(candidate_only) AS candidate_only_total,"
+                "SUM(primary_only) AS primary_only_total,"
+                "SUM(CASE WHEN candidate_only > 0 THEN 1 ELSE 0 END) AS candidate_wins,"
+                "SUM(CASE WHEN primary_only > 0 THEN 1 ELSE 0 END) AS candidate_losses "
+                "FROM release_observations "
+                "WHERE tenant_id=? AND skill_name=? AND candidate_version=?",
+                (tenant_id, skill_name, int(candidate_version)),
+            ).fetchone()
+        samples = int((row["samples"] if row else 0) or 0)
+        return {
+            "candidate_version": int(candidate_version),
+            "samples": samples,
+            "failures": int((row["failures"] if row else 0) or 0),
+            "disagreements": int((row["disagreements"] if row else 0) or 0),
+            "candidate_only_total": int((row["candidate_only_total"] if row else 0) or 0),
+            "primary_only_total": int((row["primary_only_total"] if row else 0) or 0),
+            "candidate_wins": int((row["candidate_wins"] if row else 0) or 0),
+            "candidate_losses": int((row["candidate_losses"] if row else 0) or 0),
+            # 分母为 0 时是 None，不是 0.0。0.0 会直接满足"≤ 阈值"，把
+            # "一个样本都没有"伪装成"测过了，很干净"。
+            "disagreement_rate": (
+                int((row["disagreements"] if row else 0) or 0) / samples
+                if samples else None
+            ),
+            # 退化率：只数"候选漏掉了基线报过的发现"这个方向。
+            # 对称分歧率不能当否决条件——一个每次都多报一条真问题的候选，
+            # 对称分歧率是 1.0，会被一道"分歧率 ≤ 阈值"的门禁当成退化拦下。
+            # 风险在漏，不在多，所以门禁看这个数，对称分歧率只作展示。
+            "loss_rate": (
+                int((row["candidate_losses"] if row else 0) or 0) / samples
+                if samples else None
+            ),
+            "failure_rate": (
+                int((row["failures"] if row else 0) or 0) / samples
+                if samples else None
+            ),
+        }
 
     def list_release_observations(
         self, tenant_id: str, skill_name: str, limit: int = 100,

@@ -103,8 +103,24 @@ class ReviewService:
             min_improvement=settings.eval_min_improvement,
             min_holdout_cases=settings.eval_min_holdout_cases,
             max_metric_regression=settings.eval_max_metric_regression,
+            root_cause_min_occurrences=settings.evolution_root_cause_min_occurrences,
+            max_attempts_per_root_cause=settings.evolution_max_attempts_per_root_cause,
+            parent_strategy=settings.evolution_parent_strategy,
+            parent_epsilon=settings.evolution_parent_epsilon,
             candidate_generator=(
-                RootCauseEvolutionGenerator(self.chat_client)
+                RootCauseEvolutionGenerator(
+                    self.chat_client,
+                    token_budget=settings.evolution_generator_token_budget,
+                    # 记忆读开关（轨道 D）。刻意跟着 memory_enabled 走，而
+                    # 不是新加一个环境变量：这里读的是 `remember_feedback`
+                    # 写进去的同一批 semantic 记忆，写关着时读必然为空，
+                    # 两个开关分别配置只会造出一个无意义的组合。
+                    #
+                    # 消融实验不通过这个环境变量做——它要的是同一份冻结
+                    # 快照上两个 tenant 一开一关，见 scripts/run_memory_ablation.py，
+                    # 那里直接构造两个 generator，绕过这里的全局配置。
+                    memory=self.memory if settings.memory_enabled else None,
+                )
                 if self.chat_client else None
             ),
         )
@@ -520,6 +536,8 @@ class ReviewService:
                 "state": "PENDING" if existing.get("task_id") else "ACCEPTED",
             }
         action = payload.get("action")
+        if action == "closed":
+            return self._handle_pull_request_closed(payload, delivery_id, tenant_id)
         if action not in {"opened", "reopened", "synchronize"}:
             self.store.complete_webhook(delivery_id, None)
             return {"ignored": True, "reason": "unsupported pull_request action: %s" % action}
@@ -545,6 +563,103 @@ class ReviewService:
         self.store.complete_webhook(delivery_id, result["task_id"])
         result["will_post_to_github"] = self.settings.auto_post_review
         return result
+
+    # PR 关闭事件推断出的反馈类别。刻意**不**复用 `false_positive` 等
+    # 人工类别：`record_feedback` 的那四个值意味着"人看过并确认了"，
+    # 把推断结果写进同一个字段，下游就再也分不出哪条有人背书。
+    INFERRED_CATEGORY = "merged_without_addressing"
+
+    def _handle_pull_request_closed(
+        self, payload: Dict[str, Any], delivery_id: str, tenant_id: str,
+    ) -> Dict[str, Any]:
+        """PR 合并/关闭 → 推断反馈。
+
+        ## 这个信号是什么，以及它有多弱
+
+        我们审出了 N 条问题，PR 原样合并了。这是"这些报告可能是误报"的
+        **弱**证据，绝不是确认。至少三条混淆同时存在：
+
+        1. 维护者可能明知有问题仍然合并（赶版本、后续 PR 再修）；
+        2. `EVOAGENT_AUTO_POST_REVIEW` 关闭时，我们的报告根本没出现在 PR 上，
+           没人看见过——此时合并与我们的判断完全无关；
+        3. 合并前的 commit 可能已经顺手修掉了，而我们审的是更早的版本。
+
+        所以：落盘、计数、可供分诊，但**不自动**喂给提示词进化。类别用
+        `merged_without_addressing` 而不是 `false_positive`，`auto_propose`
+        因此不会为它生成 directive——这是刻意的默认值，不是遗漏。
+
+        关闭但未合并（`merged == false`）不产出任何信号：PR 被弃掉的原因
+        与代码质量基本无关，把它算成误报确认纯粹是噪声。
+        """
+        pull = payload.get("pull_request") or {}
+        repository = (payload.get("repository") or {}).get("full_name", "")
+        number = payload.get("number")
+        if not repository or not isinstance(number, int):
+            raise ValueError("invalid GitHub pull_request payload")
+
+        def _done(result: Dict[str, Any]) -> Dict[str, Any]:
+            self.store.complete_webhook(delivery_id, None)
+            return result
+
+        if not self.settings.infer_feedback_from_merge:
+            return _done({
+                "ignored": True,
+                "reason": "merge-inferred feedback is disabled "
+                          "(set EVOAGENT_INFER_FEEDBACK_FROM_MERGE=true to enable)",
+            })
+        if not pull.get("merged"):
+            # 关闭未合并：不推断。见上文。
+            return _done({"ignored": True, "reason": "pull request was closed without merging"})
+
+        self._authorize_repository(tenant_id, repository)
+        task = self.store.find_latest_review_task(repository, number, tenant_id)
+        if not task or not task.get("report"):
+            return _done({
+                "ignored": True,
+                "reason": "no successful review task found for %s#%d" % (repository, number),
+            })
+
+        findings = (task.get("report") or {}).get("findings") or []
+        if not findings:
+            # 审出 0 条 + PR 合并了，是**弱正例**（没报错东西），但它落到
+            # 这个类别里会与"报了但被无视"混成一个数。单独回一个 reason，
+            # 不写 failure_case。
+            return _done({
+                "task_id": task["id"], "recorded": False,
+                "reason": "the review reported no findings, so a merge implies nothing to learn",
+            })
+
+        detail = {
+            "source": "inferred-from-merge",
+            "confidence": "weak",
+            "repository": repository,
+            "pull_request": number,
+            "merge_commit_sha": pull.get("merge_commit_sha", ""),
+            "findings_unaddressed": len(findings),
+            # 报告可能很大，只存判定用得上的定位与规则。
+            "findings": [
+                {
+                    "rule_id": item.get("rule_id", ""),
+                    "severity": item.get("severity", ""),
+                    "path": item.get("path", ""),
+                    "line": item.get("line"),
+                    "title": item.get("title", ""),
+                }
+                for item in findings[:50]
+            ],
+            "review_was_visible_on_pr": bool(self.settings.auto_post_review),
+            "note": "PR merged with the review findings still present. Weak evidence only: "
+                    "the maintainer may have merged knowingly, may never have seen the "
+                    "review, or may have fixed the issue in a later commit.",
+        }
+        self.store.record_failure_case(task["id"], self.INFERRED_CATEGORY, detail)
+        metrics.inc("inferred_feedback_total")
+        return _done({
+            "task_id": task["id"], "recorded": True,
+            "category": self.INFERRED_CATEGORY,
+            "source": "inferred-from-merge",
+            "findings_unaddressed": len(findings),
+        })
 
     def github_client_for_installation(self, installation_id: Optional[int] = None) -> GitHubClient:
         if installation_id is None:

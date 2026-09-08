@@ -119,6 +119,62 @@ class ProductionFeatureTests(unittest.TestCase):
         self.assertEqual("rolled_back", result["status"])
         self.assertTrue(self.store.list_alerts("tenant"))
 
+    def test_shadow_promotion_syncs_active_skill_version(self):
+        release = ReleaseManager(self.store)
+        self.store.save_skill_version("skill", "prompt v1", 0.5, True)
+        candidate = self.store.save_skill_version("skill", "prompt v2", 0.6, False)
+        release.configure("tenant", "skill", {
+            "stable_version": 1, "candidate_version": candidate["version"],
+            "canary_percent": 0, "shadow_percent": 100,
+            "min_samples": 2, "max_disagreement_rate": .5,
+            "max_error_rate": .5, "auto_promote": True,
+        })
+
+        active_before = self.store.get_active_skill_version("skill")
+        self.assertEqual(1, active_before["version"])
+
+        primary = {"finding_keys": ["a"]}
+        release.observe_shadow("tenant", "skill", "task-1", "canary", primary, primary)
+        result = release.observe_shadow("tenant", "skill", "task-2", "canary", primary, primary)
+
+        self.assertEqual("promoted", result["status"])
+        active_after = self.store.get_active_skill_version("skill")
+        self.assertEqual(candidate["version"], active_after["version"])
+
+    def test_shadow_promotion_leaves_active_alone_when_the_version_is_unknown(self):
+        """候选版本不在 skill_versions 里时，同步静默跳过——这是个隐患，钉住它。
+
+        `record_shadow_observation` 的同步分支有一道存在性检查：
+        `SELECT 1 FROM skill_versions WHERE skill_name=? AND version=?`。
+        `deployments.candidate_version` 是 `configure` 直接透传的任意整数，
+        没有外键约束，调用方给一个 `skill_versions` 里不存在的号完全合法。
+
+        此时的行为是：deployment 照常 promoted，但 `skill_versions.active`
+        **原地不动**，而且没有任何告警——`evolution.py` 下一轮读 baseline
+        仍然拿到旧版本，正是轨道 B 要修的那种"两张表悄悄分叉"。
+
+        这条测试不主张当前行为是对的（不同步好过错同步，但静默是坏的）。
+        它的作用是：谁要改成抛错或告警，得先来改这条测试，而不是让这个
+        分支继续没人知道地存在。
+        """
+        release = ReleaseManager(self.store)
+        self.store.save_skill_version("skill", "prompt v1", 0.5, True)
+        release.configure("tenant", "skill", {
+            "stable_version": 1, "candidate_version": 999,
+            "canary_percent": 0, "shadow_percent": 100,
+            "min_samples": 2, "max_disagreement_rate": .5,
+            "max_error_rate": .5, "auto_promote": True,
+        })
+
+        primary = {"finding_keys": ["a"]}
+        release.observe_shadow("tenant", "skill", "task-1", "canary", primary, primary)
+        result = release.observe_shadow("tenant", "skill", "task-2", "canary", primary, primary)
+
+        self.assertEqual("promoted", result["status"])
+        # 不会把 active 清空成"一个都没有"——那比不同步更糟，
+        # get_active_skill_version 返回 None 会让下一轮 baseline 直接消失。
+        self.assertEqual(1, self.store.get_active_skill_version("skill")["version"])
+
     def test_repair_verifier_blocks_invalid_python(self):
         result = RepairVerifier().verify_contents({"app.py": "def broken(:\n"})
         self.assertFalse(result["passed"])

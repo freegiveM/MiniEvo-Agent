@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,8 +42,10 @@ from evoagent.dataset_builder import (  # noqa: E402
     CaseRejected,
     PullRequest,
     build_case,
+    build_clean_case,
     diff_fingerprint,
     screen_title,
+    screen_title_for_clean,
     summarise,
 )
 from evoagent.evaluation_harness import validate_case  # noqa: E402
@@ -104,8 +107,11 @@ class GitHub:
                     self._log("rate limited (HTTP %d), sleeping %ds" % (exc.code, wait))
                     time.sleep(wait)
                     continue
-                if exc.code in (404, 451):
-                    # 仓库改名/PR 被删/DMCA 下架：跳过而不是中断整轮采集。
+                if exc.code in (404, 406, 451):
+                    # 仓库改名/PR 被删/DMCA 下架：跳过而不是中断整轮采集。406
+                    # 是实测踩到的：个别 PR（如超大 diff）在 diff media type 上
+                    # 返回 Not Acceptable，是这一个资源的问题，不是请求本身错了，
+                    # 跳过它不该让已经跑了几百次请求的一整轮采集前功尽弃。
                     raise LookupError("HTTP %d for %s" % (exc.code, url)) from exc
                 if 500 <= exc.code < 600 and attempt < 3:
                     time.sleep(2 ** attempt)
@@ -181,24 +187,63 @@ def load_repos(path: str) -> dict:
         return yaml.safe_load(handle)
 
 
-def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple:
+def _parse_as_of(value: str) -> datetime:
+    text = value.strip().replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def collect(
+    client: GitHub, plan: dict, cutoff: str, target_total: int,
+    clean_target_total: int = 0, as_of: str = "",
+) -> tuple:
+    """Collect positive (reverted-fix) and clean (negative) cases in one pass.
+
+    两条路径共享同一次 list_merged_pulls 分页和同一次 pull_diff 请求——
+    不为负样本单独发一轮网络请求，见模块开头的限流策略说明。
+
+    一个 PR 只会被尝试进其中一条路径，不会两条都试：build_case 要求标题
+    命中 FIX_KEYWORDS，build_clean_case 要求不命中，两者在标题判定上互斥，
+    对同一个 PR 同时跑两次是浪费。这里按"哪条路径配额还没满就先尝试哪条"
+    分流，配额都满了的 PR 直接跳过（不计入任何一侧的 rejections，因为
+    它没有被判定过，只是没被尝试）。
+    """
+    as_of_dt = _parse_as_of(as_of) if as_of else datetime.now(timezone.utc)
     cases = []
+    clean_cases = []
     rejections: dict = {}
+    clean_rejections: dict = {}
     default_pages = int((plan.get("defaults") or {}).get("max_pages", 12))
-    # 内容级去重跨仓库共享，不是每仓库一份：切分泄漏恰恰发生在
-    # validation 与 holdout 各拿到同一修复的一份时，per-repo 去重看不见它。
+    # 内容级去重跨仓库、跨正负样本共享，不是每仓库/每 split 一份：既要防止
+    # validation 与 holdout 拿到同一修复，也要防止同一个 PR 号同时被判成
+    # 正负样本（负样本用原始 diff、正样本用反转 diff，指纹不同，所以这里
+    # 额外按 (repository, number) 去重，不能只靠内容指纹）。
     seen_fingerprints: dict = {}
+    seen_pull_ids: set = set()
 
     for entry in plan["repos"]:
         repository = entry["name"]
         split = entry["split"]
         quota = int(entry.get("target_prs", 5))
+        # clean_target_total 是整个负样本路径的主开关：即便 repos.yaml 给了
+        # 某个仓库 clean_target_prs，只要调用方没有传非零的 clean_target_total
+        # （即命令行没显式给 --clean-target），这里也强制清零。不这样做的话，
+        # repos.yaml 里配了 clean_target_prs 就会让"不加 --clean-target 就
+        # 不采负样本"这条默认行为失效——见 main() 里 --clean-target 的
+        # help 文案，这个默认关闭是刻意的，不能被 repos.yaml 的配置绕过。
+        clean_quota = (
+            int(entry.get("clean_target_prs", 0)) if clean_target_total > 0 else 0
+        )
         max_pages = int(entry.get("max_pages", default_pages))
         accepted = 0
-        print("\n== %s (%s, want %d) ==" % (repository, split, quota), flush=True)
+        clean_accepted = 0
+        print("\n== %s (%s, want %d, clean %d) ==" % (
+            repository, split, quota, clean_quota), flush=True)
 
         for page in range(1, max_pages + 1):
-            if accepted >= quota:
+            if accepted >= quota and clean_accepted >= clean_quota:
                 break
             try:
                 pulls = client.list_merged_pulls(repository, page)
@@ -207,90 +252,146 @@ def collect(client: GitHub, plan: dict, cutoff: str, target_total: int) -> tuple
                 # 照常返回让上层出报告。抛到最外层会丢掉这一轮的全部成果。
                 print("\n[budget] %s — stopping early, keeping what we have"
                       % exc, flush=True)
-                return cases, rejections
+                return cases, rejections, clean_cases, clean_rejections
             except LookupError as exc:
                 print("  skipping repository: %s" % exc, flush=True)
                 break
             if not pulls:
                 break
             for item in pulls:
-                if accepted >= quota:
+                if accepted >= quota and clean_accepted >= clean_quota:
                     break
                 number = int(item["number"])
+                pull_id = (repository, number)
+                if pull_id in seen_pull_ids:
+                    continue
+
+                want_positive = accepted < quota
+                want_clean = not want_positive and clean_accepted < clean_quota
+                if not want_positive and not want_clean:
+                    continue
+
+                title = item.get("title") or ""
+                body = item.get("body") or ""
                 # 标题级淘汰在抓 diff **之前**做：这两条规则不需要 diff，
                 # 而 diff 是唯一要花请求的东西。首轮 pilot 实测 53 次请求里
                 # 42 次浪费在"抓完 diff 才发现是 dependabot bump"上。
                 # 淘汰原因照常记账，漏斗统计口径不变。
-                screened = screen_title(item.get("title") or "",
-                                        item.get("body") or "")
+                if want_positive:
+                    screened = screen_title(title, body)
+                    bucket, bucket_key = rejections, "screened"
+                else:
+                    screened = screen_title_for_clean(title, body)
+                    bucket, bucket_key = clean_rejections, "screened"
                 if screened is not None:
-                    rejections[screened] = rejections.get(screened, 0) + 1
+                    bucket[screened] = bucket.get(screened, 0) + 1
                     continue
+
                 try:
                     diff = client.pull_diff(repository, number)
                 except BudgetExhausted as exc:
                     print("\n[budget] %s — stopping early, keeping what we have"
                           % exc, flush=True)
-                    return cases, rejections
+                    return cases, rejections, clean_cases, clean_rejections
                 except LookupError:
-                    rejections["diff-unavailable"] = rejections.get("diff-unavailable", 0) + 1
+                    bucket["diff-unavailable"] = bucket.get("diff-unavailable", 0) + 1
                     continue
                 pull = PullRequest(
                     repository=repository,
                     number=number,
-                    title=item.get("title") or "",
-                    body=item.get("body") or "",
+                    title=title,
+                    body=body,
                     merged_at=item["merged_at"],
                     diff=diff,
                     html_url=item.get("html_url") or "",
                 )
-                try:
-                    case = build_case(pull, split, cutoff, entry.get("domain", ""))
-                    # 与既有 harness 一致是硬要求。校验失败当成淘汰，不中断采集：
-                    # 单条坏数据不该毁掉一轮几百次请求的成果。
-                    validate_case(case)
-                except CaseRejected as exc:
-                    rejections[exc.reason] = rejections.get(exc.reason, 0) + 1
-                    continue
-                except ValueError as exc:
-                    rejections["validate-case-failed"] = (
-                        rejections.get("validate-case-failed", 0) + 1
-                    )
-                    print("  ! #%d rejected by validate_case: %s" % (number, exc),
-                          flush=True)
-                    continue
-                # 内容指纹按**反转后的待审 diff**算，也就是 agent 真正看到的
-                # 输入。两条 case 输入相同就是重复，无论它们来自哪个 PR。
-                fingerprint = diff_fingerprint(case["diff"])
-                if fingerprint in seen_fingerprints:
-                    rejections["duplicate-diff"] = (
-                        rejections.get("duplicate-diff", 0) + 1
-                    )
-                    print("  = #%-6d duplicate of %s" % (
-                        number, seen_fingerprints[fingerprint]), flush=True)
-                    continue
-                seen_fingerprints[fingerprint] = case["id"]
-                cases.append(case)
-                accepted += 1
-                print("  + #%-6d %-16s %s  %s" % (
-                    number, case["defect_class"], case["difficulty"],
-                    case["contamination_split"],
-                ), flush=True)
+
+                if want_positive:
+                    try:
+                        case = build_case(pull, split, cutoff, entry.get("domain", ""))
+                        # 与既有 harness 一致是硬要求。校验失败当成淘汰，不中断
+                        # 采集：单条坏数据不该毁掉一轮几百次请求的成果。
+                        validate_case(case)
+                    except CaseRejected as exc:
+                        rejections[exc.reason] = rejections.get(exc.reason, 0) + 1
+                        continue
+                    except ValueError as exc:
+                        rejections["validate-case-failed"] = (
+                            rejections.get("validate-case-failed", 0) + 1
+                        )
+                        print("  ! #%d rejected by validate_case: %s" % (number, exc),
+                              flush=True)
+                        continue
+                    # 内容指纹按**反转后的待审 diff**算，也就是 agent 真正看到的
+                    # 输入。两条 case 输入相同就是重复，无论它们来自哪个 PR。
+                    fingerprint = diff_fingerprint(case["diff"])
+                    if fingerprint in seen_fingerprints:
+                        rejections["duplicate-diff"] = (
+                            rejections.get("duplicate-diff", 0) + 1
+                        )
+                        print("  = #%-6d duplicate of %s" % (
+                            number, seen_fingerprints[fingerprint]), flush=True)
+                        continue
+                    seen_fingerprints[fingerprint] = case["id"]
+                    seen_pull_ids.add(pull_id)
+                    cases.append(case)
+                    accepted += 1
+                    print("  + #%-6d %-16s %s  %s" % (
+                        number, case["defect_class"], case["difficulty"],
+                        case["contamination_split"],
+                    ), flush=True)
+                else:
+                    try:
+                        clean_case = build_clean_case(
+                            pull, split, cutoff, as_of_dt, entry.get("domain", ""),
+                        )
+                        validate_case(clean_case)
+                    except CaseRejected as exc:
+                        clean_rejections[exc.reason] = (
+                            clean_rejections.get(exc.reason, 0) + 1
+                        )
+                        continue
+                    except ValueError as exc:
+                        clean_rejections["validate-case-failed"] = (
+                            clean_rejections.get("validate-case-failed", 0) + 1
+                        )
+                        print("  ! #%d (clean) rejected by validate_case: %s"
+                              % (number, exc), flush=True)
+                        continue
+                    fingerprint = diff_fingerprint(clean_case["diff"])
+                    if fingerprint in seen_fingerprints:
+                        clean_rejections["duplicate-diff"] = (
+                            clean_rejections.get("duplicate-diff", 0) + 1
+                        )
+                        print("  = #%-6d (clean) duplicate of %s" % (
+                            number, seen_fingerprints[fingerprint]), flush=True)
+                        continue
+                    seen_fingerprints[fingerprint] = clean_case["id"]
+                    seen_pull_ids.add(pull_id)
+                    clean_cases.append(clean_case)
+                    clean_accepted += 1
+                    print("  ~ #%-6d clean            %s" % (
+                        number, clean_case["contamination_split"],
+                    ), flush=True)
 
         if accepted < quota:
             print("  (only %d/%d accepted — funnel is tight on this repo)"
                   % (accepted, quota), flush=True)
-        if len(cases) >= target_total:
-            print("\nreached target of %d cases" % target_total, flush=True)
+        if clean_quota and clean_accepted < clean_quota:
+            print("  (only %d/%d clean accepted — funnel is tight on this repo)"
+                  % (clean_accepted, clean_quota), flush=True)
+        if len(cases) >= target_total and len(clean_cases) >= clean_target_total:
+            print("\nreached target of %d cases (%d clean)"
+                  % (target_total, clean_target_total), flush=True)
             break
 
-    return cases, rejections
+    return cases, rejections, clean_cases, clean_rejections
 
 
-def print_report(cases: list, rejections: dict) -> bool:
+def print_report(cases: list, rejections: dict, label: str = "collected") -> bool:
     report = summarise(cases, rejections)
     print("\n" + "=" * 66)
-    print("collected %d cases" % report.total)
+    print("%s %d cases" % (label, report.total))
     # 顺序有讲究：defect class basis **紧跟** defect class。
     # 原来这两块被 contamination / label provenance 隔开了，注释写着"紧跟"
     # 但代码不是——读者看完 "logic-boundary 89%" 会直接往下用，隔了两块
@@ -337,11 +438,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repos", default="datasets/repos.yaml")
     parser.add_argument("--output", default="datasets/real-pr-v1.jsonl")
+    parser.add_argument("--clean-output", default="datasets/real-pr-clean-v1.jsonl",
+                        help="output path for clean (negative) cases")
     parser.add_argument("--cache", default="datasets/.diff-cache")
     parser.add_argument("--cutoff", default="",
                         help="model knowledge cutoff; overrides repos.yaml")
     parser.add_argument("--target", type=int, default=0,
                         help="stop after this many cases; overrides repos.yaml")
+    parser.add_argument(
+        "--clean-target", type=int, default=0,
+        help=("stop after this many clean (negative) cases; overrides "
+              "repos.yaml's per-repo clean_target_prs. Defaults to 0 "
+              "(collect no clean cases) so an existing run's output shape "
+              "does not change unless this is asked for explicitly."),
+    )
+    parser.add_argument(
+        "--as-of", default="",
+        help=("ISO timestamp used as 'now' for the clean-split cooldown check "
+              "(CLEAN_COOLDOWN_DAYS). Defaults to the actual current time. "
+              "Exists so a run can be reproduced exactly."),
+    )
     parser.add_argument("--report-only", action="store_true",
                         help="re-report an existing JSONL without collecting")
     parser.add_argument(
@@ -365,6 +481,10 @@ def main() -> int:
     plan = load_repos(args.repos)
     cutoff = args.cutoff or plan.get("cutoff") or "2024-07-01"
     target = args.target or int(plan.get("target_total", 100))
+    # clean_target 只看 --clean-target，不回落到 repos.yaml 的
+    # clean_target_total：这是负样本路径的显式开关，即使 repos.yaml 配了
+    # 总量，不传这个 flag 就必须保持不采（help 文案已经写明这一点）。
+    clean_target = args.clean_target
 
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token and not args.pilot:
@@ -383,8 +503,9 @@ def main() -> int:
         # pilot 的产出必须无法被误当成数据集。改文件名而不是加字段：
         # 字段会被下游忽略，文件名不会。
         args.output = args.output + ".pilot"
-        print("PILOT MODE: at most %d requests, %s auth, writing %s"
-              % (args.pilot, "with" if token else "WITHOUT", args.output))
+        args.clean_output = args.clean_output + ".pilot"
+        print("PILOT MODE: at most %d requests, %s auth, writing %s (+ %s if any clean cases)"
+              % (args.pilot, "with" if token else "WITHOUT", args.output, args.clean_output))
 
     client = GitHub(
         token, args.cache,
@@ -393,23 +514,41 @@ def main() -> int:
         rate_floor=RATE_FLOOR if token else 0,
     )
     started = time.time()
-    cases, rejections = collect(client, plan, cutoff, target)
+    cases, rejections, clean_cases, clean_rejections = collect(
+        client, plan, cutoff, target, clean_target, args.as_of,
+    )
 
-    ok = print_report(cases, rejections)
+    ok = print_report(cases, rejections, "collected")
+    clean_ok = True
+    if clean_target or clean_cases or clean_rejections:
+        clean_ok = print_report(clean_cases, clean_rejections, "collected (clean)")
     print("\n%d API requests, %d served from cache, %.1f min elapsed" % (
         client.requests, client.cache_hits, (time.time() - started) / 60.0,
     ))
+    print("positive_cases=%d clean_cases=%d" % (len(cases), len(clean_cases)))
 
-    if not cases:
+    if not cases and not clean_cases:
         print("no cases collected; nothing written", file=sys.stderr)
         return 1
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
-        for case in cases:
-            handle.write(json.dumps(case, ensure_ascii=False, sort_keys=True) + "\n")
-    print("wrote %s" % args.output)
-    return 0 if ok else 1
+    if cases:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
+            for case in cases:
+                handle.write(json.dumps(case, ensure_ascii=False, sort_keys=True) + "\n")
+        print("wrote %s" % args.output)
+
+    if clean_cases:
+        # 独立文件，不与正样本混进同一个 .jsonl：见 datasets/README.md
+        # "Clean split（负样本）"一节的说明——混在一起会让"重放
+        # real-pr-v1.jsonl"这句话的含义悄悄变化。
+        os.makedirs(os.path.dirname(os.path.abspath(args.clean_output)), exist_ok=True)
+        with open(args.clean_output, "w", encoding="utf-8", newline="\n") as handle:
+            for case in clean_cases:
+                handle.write(json.dumps(case, ensure_ascii=False, sort_keys=True) + "\n")
+        print("wrote %s" % args.clean_output)
+
+    return 0 if (ok and clean_ok) else 1
 
 
 if __name__ == "__main__":

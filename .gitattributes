@@ -1,0 +1,42 @@
+# 行尾归一化。
+#
+# 存在的理由是一个真实的 clone 故障：`skills/*/skill.json` 里的 `sha256`
+# 是对 `skill.py` **逐字节**算的（`evoagent/skills.py:_validate_manifest`
+# 用 `open(..., "rb")` 读原始字节再比对）。仓库里以 LF 存储，而 Windows
+# 上 git 默认 `core.autocrlf=true`，checkout 时把 LF 换成 CRLF——文件内容
+# 在语义上没变，字节变了，校验和当场不匹配：
+#
+#     ValueError: skill checksum mismatch: code-quality
+#
+# 后果不是某个测试挂了，是**技能注册表整个加载不起来**，5 个测试连带失败，
+# 服务起不来。也就是说：任何 Windows 用户 clone 下来都跑不动，而错误信息
+# 指向校验和，看不出根因是行尾。
+#
+# 这不能靠"叫用户改 core.autocrlf"解决——那是要求每个使用者先知道这个坑。
+# 归一化写在仓库里，checkout 行为就不再取决于各人的 git 配置。
+* text=auto eol=lf
+
+# 二进制与逐字节校验的资产：明确排除任何转换。
+#
+# `skill.py` 已经被上面的 `eol=lf` 覆盖，这里再单独钉一次是有意的冗余：
+# 上面那行是"整个仓库的默认策略"，改它的动机（比如将来想让某类文件跟随
+# 平台）不该顺手把校验和一起弄坏。
+skills/**/*.py text eol=lf
+skills/**/*.json text eol=lf
+
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.whl binary
+*.pyc binary
+
+# 语料是 JSON Lines，指纹按行内容算，同样钉 LF。
+*.jsonl text eol=lf

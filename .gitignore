@@ -9,6 +9,11 @@ __pycache__/
 output/
 datasets/*.db
 
+# 脚本的运行日志。落在仓库根目录是因为它们是长跑任务的 tee 输出
+# （`relabel_full.log` 就是全量重标那一次的），内容是某台机器某一次跑的
+# 进度流，对 clone 下来的人没有任何用，且会随每次重跑变成一份大 diff。
+*.log
+
 # 数据集本体与抓取缓存不入库：几十 MB 的 diff，且可由 repos.yaml 完全复现。
 # 入库的是**采集器 + 仓库清单 + 筛选规则**（即"怎么得到它"），
 # 而不是产物——产物入库反而会让人误以为数据集是手工整理的。
@@ -25,3 +30,10 @@ datasets/.diff-cache/
 # 重跑任何脚本都生成不出来。丢了就得从头标一遍，而且重标的结果与
 # 原来的不是同一批数据（rubric 会漂）。
 !datasets/labelling-*.json
+
+# 待标注的候选清单**不入库**。它是 `derive_candidates` 从
+# `real-pr-v1.jsonl` + 回放检查点算出来的产物，label 全为空——里面还没有
+# 任何人判的信息，重跑脚本就能再生成一份。这与上面那条不矛盾：入库的
+# 判据是"有没有生成不出来的人工判断"，不是文件名长什么样。
+# 一旦某份候选清单标完了，它该改名成 `labelling-*.json` 入库。
+datasets/feedback-candidates-*.json

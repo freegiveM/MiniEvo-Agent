@@ -223,5 +223,104 @@ class CliReachabilityTests(unittest.TestCase):
         self.assertIn("critic_position_check=args.critic_position_check", script)
 
 
+class EvolutionNonRegressionTransparencyTests(unittest.TestCase):
+    """同一条纪律用在 `_propose` 的受保护指标上。
+
+    `_non_regressing` 的 None 处理本身也是对的：`_metric_non_regressing` 在
+    baseline 为 None 时放行——那一档本来就没测过，无从回退。
+
+    问题同样在报告。holdout 里 0 条 high/critical 样本，
+    `high_severity_recall` 恒为 None vs None，于是这道受保护指标恒不退化、
+    恒通过。报告上看着有四道受保护指标，实际只有三道在工作，而
+    `holdout_non_regression: true` 与真的没退化长得一模一样。
+
+    这与 `completeness` 恒 1.0 是同一类错误：**一道假装在工作的门禁，比一个
+    缺失的门禁更危险**——前者会让人以为已经被保护了。
+    """
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        from evoagent.evolution import EvolutionEngine
+        from evoagent.store import TaskStore
+
+        handle, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        self.engine = EvolutionEngine(TaskStore(self.path), seed_defaults=False)
+
+    def tearDown(self):
+        import os
+
+        os.unlink(self.path)
+
+    @staticmethod
+    def _metrics(**overrides):
+        base = {
+            "score": 0.8, "precision": 0.9, "recall": 0.7,
+            "high_severity_recall": 0.6, "positive_cases": 5, "clean_cases": 5,
+            "severity_accuracy": 0.8, "clean_accuracy": 0.9,
+        }
+        base.update(overrides)
+        return base
+
+    def test_an_empty_denominator_metric_is_listed_as_unmeasurable(self):
+        """**本组最要紧的断言。** 这就是 holdout 上 high_severity_recall
+        的真实形态：两侧都是 None，门禁通过，但什么都没验证。
+        """
+        report = self.engine._non_regression_report(
+            self._metrics(high_severity_recall=None),
+            self._metrics(high_severity_recall=None),
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(["high_severity_recall"], report["unmeasurable"])
+
+    def test_a_real_regression_is_not_called_unmeasurable(self):
+        """0.5 vs 0.6 是个结论（测了，退了），不是"测不出来"。"""
+        report = self.engine._non_regression_report(
+            self._metrics(high_severity_recall=0.5),
+            self._metrics(high_severity_recall=0.6),
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual([], report["unmeasurable"])
+        self.assertEqual(["high_severity_recall"], report["regressed"])
+
+    def test_a_candidate_that_destroys_a_measurable_metric_still_fails(self):
+        """透明化不能顺手把门禁放宽：baseline 有数、候选变 None 仍要拦。
+
+        候选把一个原本可测的指标变成测不出来（比如一条 finding 都不报 →
+        precision 无定义），这是实质回退。
+        """
+        report = self.engine._non_regression_report(
+            self._metrics(precision=None), self._metrics(precision=0.9),
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertIn("precision", report["regressed"])
+        # baseline 侧有定义，所以这不是"没测"。
+        self.assertEqual([], report["unmeasurable"])
+
+    def test_the_rejection_reason_names_the_metric(self):
+        """"a protected metric regressed"不说是哪个，同一根因会被反复重试。
+
+        与 `retention_gate` 的 reason 点名删了哪几条规则同一个理由。
+        """
+        report = self.engine._non_regression_report(
+            self._metrics(recall=0.1), self._metrics(recall=0.7),
+        )
+        self.assertEqual(["recall"], report["regressed"])
+
+    def test_the_verdict_is_unchanged_by_the_added_reporting(self):
+        """`_non_regressing` 仍然只是 report["passed"] 的别名。"""
+        candidate = self._metrics(recall=0.1)
+        baseline = self._metrics()
+        self.assertEqual(
+            self.engine._non_regressing(candidate, baseline),
+            self.engine._non_regression_report(candidate, baseline)["passed"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

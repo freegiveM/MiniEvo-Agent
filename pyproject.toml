@@ -1,0 +1,78 @@
+# 打包元数据。
+#
+# 这个文件此前不存在，仓库里没有任何打包信息——`pip install -e .` 装不上，
+# 也就没有 extras 可用，于是 `requirements.txt` 只能把可选依赖和必需依赖
+# 混在一起列（见那个文件顶部的说明）。加这份 pyproject 的第一目的就是
+# 让"可选"这件事在工具层面表达得出来，而不是靠注释请用户自觉。
+#
+# 不做 src/ 布局：`evoagent/`、`tests/`、`scripts/` 已经是平铺的，改布局
+# 会动到几十个 `sys.path.insert(..., parents[1])` 的脚本，收益只有目录整齐。
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evoagent"
+# 与 `evoagent/__init__.py` 的 `__version__` 手动保持一致。
+# 没用 dynamic version 是因为 setuptools 读 `__version__` 需要 import 或
+# 正则扫描，两者都要额外配置，而这个项目现在一年也发不了几次。
+version = "0.3.0"
+description = "A self-evolving PR review agent with gated prompt/skill evolution"
+readme = "README.md"
+license = { file = "LICENSE" }
+# 3.11 是硬下限，不是保守估计：代码里用了 `match` 语句
+# （`evaluation_harness.py`、`evaluation_v2.py`、`feedback_import.py`），
+# 且 Dockerfile 基于 `python:3.11-slim`，评测数字都是在这个版本上跑出来的。
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+# 核心依赖只有一个。服务本身（HTTP、存储、LLM 调用）全走标准库。
+dependencies = [
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+# GitHub App 认证。只在配了 App 私钥时走到；用 PAT 或不接 GitHub 时不需要。
+github = ["PyJWT[crypto]>=2.8,<3"]
+# Redis Streams 任务队列。不配 EVOAGENT_REDIS_URL 时用内存 ACK 队列，
+# 功能完整（README 已注明：跑过测试的是内存后端）。
+queue = ["redis>=5,<7"]
+# OTLP tracing。缺失时 observability.py 静默关掉 tracing。
+telemetry = [
+    "opentelemetry-sdk>=1.24,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.24,<2",
+]
+all = [
+    "PyJWT[crypto]>=2.8,<3",
+    "redis>=5,<7",
+    "opentelemetry-sdk>=1.24,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.24,<2",
+]
+
+[project.scripts]
+evoagent = "evoagent.api:run"
+
+[tool.setuptools]
+# 显式列包，不用自动发现：自动发现会把 `tests`、`scripts`、`prototypes`
+# 一起当成包装进 wheel。`prototypes/` 尤其不能进——它按自己的 docstring
+# 就是"没跑过评测的原型"，装到别人的 site-packages 里会被当成可用模块。
+packages = ["evoagent"]
+
+# 注意：`skills/` **不随 wheel 走**，它在包外面。技能是按文件系统路径加载的
+# （`skills.py` 读 `skill.py` 的原始字节，比对 `skill.json` 里的 sha256），
+# 路径来自 `EVOAGENT_SKILLS_DIR`。也就是说 `pip install evoagent` 装不到
+# 技能，得从仓库里带一份目录并指向它——这是现状而非设计，写在这里免得
+# 有人以为 `packages = ["evoagent"]` 漏了什么。
+#
+# 顺带一提，那个逐字节校验也是 `.gitattributes` 里钉 LF 的原因：git 的
+# 行尾转换会让同一份技能在 Windows 上算出不同的 sha256。
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

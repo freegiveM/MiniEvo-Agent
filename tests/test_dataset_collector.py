@@ -98,7 +98,7 @@ class CollectTests(unittest.TestCase):
             {"octocat/hello": [pulls]},
             {("octocat/hello", n): good_diff(n) for n in (1, 2, 3, 4, 5)},
         )
-        cases, _rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
+        cases, _rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(2, len(cases))
         # 配额满了就不再抓 diff：多抓一次就是白烧一次配额。
         self.assertEqual(2, len(client.diff_calls))
@@ -113,7 +113,7 @@ class CollectTests(unittest.TestCase):
             {"octocat/hello": [pulls]},
             {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
         )
-        cases, rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(1, len(cases))
         self.assertEqual(1, rejections["not-a-bugfix"])
         self.assertEqual(1, rejections["excluded-keyword"])
@@ -130,7 +130,7 @@ class CollectTests(unittest.TestCase):
             {"octocat/hello": [[_pull(1), _pull(2)]]},
             {("octocat/hello", 2): GOOD_DIFF},
         )
-        cases, rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(1, len(cases))
         self.assertEqual(1, rejections["diff-unavailable"])
 
@@ -142,7 +142,7 @@ class CollectTests(unittest.TestCase):
             ]},
             {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
         )
-        cases, _rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
+        cases, _rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(2, len(cases))
 
     def test_global_target_stops_collection_across_repositories(self):
@@ -162,7 +162,7 @@ class CollectTests(unittest.TestCase):
              for repo, n in (("octocat/one", 1), ("octocat/one", 2),
                              ("octocat/two", 3), ("octocat/two", 4))},
         )
-        cases, _rejections = collector.collect(client, plan, "2024-07-01", 2)
+        cases, _rejections, _clean_cases, _clean_rejections = collector.collect(client, plan, "2024-07-01", 2)
         self.assertEqual(2, len(cases))
         self.assertEqual({"octocat/one"}, {case["repository"] for case in cases})
 
@@ -171,7 +171,7 @@ class CollectTests(unittest.TestCase):
             {"octocat/hello": [[_pull(1)]]},
             {("octocat/hello", 1): GOOD_DIFF},
         )
-        cases, _rejections = collector.collect(
+        cases, _rejections, _clean_cases, _clean_rejections = collector.collect(
             client, self._plan(split="holdout", domain="security-tool", target_prs=1),
             "2024-07-01", 100,
         )
@@ -186,7 +186,7 @@ class CollectTests(unittest.TestCase):
             ]]},
             {("octocat/hello", 1): good_diff(1), ("octocat/hello", 2): good_diff(2)},
         )
-        cases, _rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
+        cases, _rejections, _clean_cases, _clean_rejections = collector.collect(client, self._plan(), "2024-07-01", 100)
         self.assertEqual(
             {"pre-cutoff", "post-cutoff"},
             {case["contamination_split"] for case in cases},
@@ -205,7 +205,7 @@ class DedupTests(unittest.TestCase):
             # 三个 PR 同一份 diff：真实世界里这就是 backport 或重复落地。
             {("octocat/hello", n): GOOD_DIFF for n in (1, 2, 3)},
         )
-        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, plan, "2024-07-01", 100)
         self.assertEqual(1, len(cases))
         self.assertEqual(2, rejections.get("duplicate-diff"))
 
@@ -223,7 +223,7 @@ class DedupTests(unittest.TestCase):
             {"octocat/one": [[_pull(1)]], "octocat/two": [[_pull(2)]]},
             {("octocat/one", 1): GOOD_DIFF, ("octocat/two", 2): GOOD_DIFF},
         )
-        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, plan, "2024-07-01", 100)
         self.assertEqual(1, len(cases))
         self.assertEqual(1, rejections.get("duplicate-diff"))
         # 留下的是先遇到的那个，holdout 那份被拦住。
@@ -238,7 +238,7 @@ class DedupTests(unittest.TestCase):
             {"octocat/hello": [[_pull(1), _pull(2), _pull(3)]]},
             {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
         )
-        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, plan, "2024-07-01", 100)
         self.assertEqual(3, len(cases))
         self.assertIsNone(rejections.get("duplicate-diff"))
 
@@ -258,7 +258,7 @@ class PreScreenTests(unittest.TestCase):
             ]]},
             {("octocat/hello", n): good_diff(n) for n in (1, 2, 3)},
         )
-        cases, rejections = collector.collect(client, plan, "2024-07-01", 100)
+        cases, rejections, _clean_cases, _clean_rejections = collector.collect(client, plan, "2024-07-01", 100)
         self.assertEqual(1, len(cases))
         # 核心断言：只为第 3 个 PR 抓了 diff。前两个一次请求都没花。
         self.assertEqual([("octocat/hello", 3)], client.diff_calls)
@@ -307,6 +307,69 @@ class ReportOnlyTests(unittest.TestCase):
                 sys.argv = argv
         finally:
             os.unlink(path)
+
+
+class CleanCaseCollectionTests(unittest.TestCase):
+    """负样本路径复用同一次分页/diff 请求，且与正样本互斥。"""
+
+    # 冷却期从 merged_at 起算 >= CLEAN_COOLDOWN_DAYS(180)。
+    AS_OF = "2026-01-01T00:00:00Z"
+
+    def _plan(self, **overrides):
+        entry = {
+            "name": "octocat/hello", "split": "validation",
+            "domain": "crypto-ssh", "target_prs": 0, "clean_target_prs": 2,
+        }
+        entry.update(overrides)
+        return {"repos": [entry], "defaults": {"max_pages": 3}}
+
+    def test_ordinary_feature_prs_are_collected_as_clean_cases(self):
+        pulls = [_pull(n, title="Add CSV export for reports") for n in (1, 2)]
+        client = FakeGitHub(
+            {"octocat/hello": [pulls]},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2)},
+        )
+        cases, rejections, clean_cases, clean_rejections = collector.collect(
+            client, self._plan(), "2024-07-01", 0, 2, self.AS_OF,
+        )
+        self.assertEqual([], cases)
+        self.assertEqual(2, len(clean_cases))
+        self.assertTrue(all(c["expected_findings"] == [] for c in clean_cases))
+        self.assertTrue(all(c["source"]["kind"] == "real-pr-clean" for c in clean_cases))
+
+    def test_a_bugfix_looking_pr_never_ends_up_in_the_clean_split(self):
+        """正样本配额用完后，看起来像 bugfix 的 PR 仍不能滑进负样本。
+
+        target_prs=1 的第一个 PR 先填满正样本配额；第二个 PR 标题同样
+        像 bugfix，此时只有负样本配额还空——它必须被 screen_title_for_clean
+        拒绝（looks-like-a-bugfix），不能因为"反正配额还有空位"就被当成
+        负样本收进去。
+        """
+        pulls = [
+            _pull(1, title="Fix weak hash in token computation"),
+            _pull(2, title="Fix another crash on empty input"),
+        ]
+        client = FakeGitHub(
+            {"octocat/hello": [pulls]},
+            {("octocat/hello", n): good_diff(n) for n in (1, 2)},
+        )
+        plan = self._plan(target_prs=1, clean_target_prs=1)
+        cases, rejections, clean_cases, clean_rejections = collector.collect(
+            client, plan, "2024-07-01", 1, 1, self.AS_OF,
+        )
+        self.assertEqual(1, len(cases))
+        self.assertEqual([], clean_cases)
+        self.assertEqual(1, clean_rejections.get("looks-like-a-bugfix", 0))
+
+    def test_the_positive_and_clean_paths_share_the_same_diff_fetch(self):
+        """两条路径复用同一次 list/diff 请求，不为负样本单独发一轮请求。"""
+        pulls = [_pull(1, title="Add CSV export for reports")]
+        client = FakeGitHub(
+            {"octocat/hello": [pulls]},
+            {("octocat/hello", 1): good_diff(1)},
+        )
+        collector.collect(client, self._plan(clean_target_prs=1), "2024-07-01", 0, 1, self.AS_OF)
+        self.assertEqual([("octocat/hello", 1)], client.diff_calls)
 
 
 if __name__ == "__main__":
