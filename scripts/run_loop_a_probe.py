@@ -19,11 +19,13 @@
 两种都是通过。**不通过**的形状只有一个：第一轮没进评测、第二轮却选不到
 反馈了——那说明账本仍然在为无关失败记账。
 
-## 为什么逐轮落盘
+## 为什么逐样本落盘
 
 一轮 = 一次候选生成（LLM）+ 基线与候选各一次全量回放（每条样本一次 LLM
-调用）。第二轮失败不该让第一轮的结果一起丢。每轮结束立刻 append + flush +
-fsync。
+调用）。`max_cases=20` 下那是 81 次调用、一个多小时。所以两级落盘：每条
+样本回放完立刻写 `replay.jsonl`，每轮结束写 `rounds.jsonl`，都是 append +
+flush + fsync。中途崩了续跑时，已回放的样本直接复用，不重复花钱——失败的
+调用也是照常计费的。
 
 ## 只读写指定的库
 
@@ -35,12 +37,131 @@ fsync。
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+class ReplayCheckpoint:
+    """逐次回放落盘 + 断点续跑。
+
+    ## 为什么"逐轮落盘"不够
+
+    一轮 = 一次候选生成 + 基线与候选各一次全量回放。`max_cases=20` 下那是
+    81 次 LLM 调用、一个多小时，而这个脚本原来只在**整轮结束**时才写一行。
+    于是两件事同时成立：跑到第 70 次失败会让前 69 次的钱全部作废（失败的
+    调用照常计费），而且从外部完全看不出进度——"跑到第 60 条了"和"卡在
+    某次调用上"长得一模一样。
+
+    ## 键是 (prompt, diff)，不是样本 id
+
+    这个脚本拿不到样本 id：`RegressionEvaluator.run` 只把 `diff` 和 `parsed`
+    交给评审器。但 (prompt, diff) 恰好是**正确**的键——同一份提示词加同一份
+    diff 就是同一个回放单元，所以基线与候选天然分到两个键上，不会互相顶掉。
+    拿样本 id 当键反而是错的：基线和候选在同一条样本上会撞键。
+
+    ## 不缓存异常
+
+    一次超时或 provider 抖动如果被写进检查点，续跑时会把它当成"这条样本的
+    结论"永久重放——一个瞬时故障就变成了固定结果。所以只落成功的结果，
+    失败的下次重跑。这与 `RegressionEvaluator` 把失败算作漏报是两回事：
+    那是评测口径，这里是缓存纪律。
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.cache: dict = {}
+        self.hits = 0
+        self.misses = 0
+        if path.exists():
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        record = json.loads(line)
+                        self.cache[record["key"]] = record["findings"]
+
+    @staticmethod
+    def key(prompt: str, diff: str) -> str:
+        digest = hashlib.sha256()
+        # 分隔符不可省：没有它，("ab", "c") 与 ("a", "bc") 会算出同一个键。
+        digest.update(prompt.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(diff.encode("utf-8"))
+        return digest.hexdigest()
+
+    def get(self, key: str):
+        if key in self.cache:
+            self.hits += 1
+            return self.cache[key]
+        return None
+
+    def put(self, key: str, findings: list, meta: dict) -> None:
+        self.misses += 1
+        self.cache[key] = findings
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(
+                {"key": key, "findings": findings, **meta},
+                ensure_ascii=False, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def checkpointing_factory(inner, checkpoint: ReplayCheckpoint, progress):
+    """把 reviewer_factory 包一层，逐次回放走检查点。
+
+    包在工厂这一层而不是改 `RegressionEvaluator`：引擎是被测对象，为了观测
+    它而改它，测到的就不再是生产路径上那段代码。工厂是引擎的注入点，包在
+    这里对引擎完全透明。
+    """
+
+    from evoagent.models import Finding, Severity
+
+    def to_json(findings):
+        return [item.to_dict() for item in findings]
+
+    def from_json(records):
+        restored = []
+        for record in records:
+            value = dict(record)
+            value["severity"] = Severity(value["severity"])
+            restored.append(Finding(**value))
+        return restored
+
+    def factory(prompt: str):
+        reviewer = inner(prompt)
+
+        class Checkpointed:
+            name = getattr(reviewer, "name", reviewer.__class__.__name__)
+
+            def review(self, diff, parsed):
+                key = checkpoint.key(prompt, diff)
+                cached = checkpoint.get(key)
+                if cached is not None:
+                    progress("cached", key, 0.0, len(cached))
+                    return from_json(cached)
+                started = time.monotonic()
+                findings = reviewer.review(diff, parsed)
+                elapsed = time.monotonic() - started
+                # 只落成功的结果。异常直接往上抛给 RegressionEvaluator，
+                # 由它按自己的口径记成漏报。
+                checkpoint.put(key, to_json(findings), {
+                    "prompt_sha": hashlib.sha256(
+                        prompt.encode("utf-8")).hexdigest()[:12],
+                    "elapsed_ms": int(elapsed * 1000),
+                })
+                progress("fresh", key, elapsed, len(findings))
+                return findings
+
+        return Checkpointed()
+
+    return factory
 
 
 def snapshot(store, skill_name: str) -> dict:
@@ -128,6 +249,11 @@ def main() -> int:
     parser.add_argument("--skill", default="llm-review")
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--out", default="output/loop-a")
+    parser.add_argument(
+        "--checkpoint", default="",
+        help="逐样本回放检查点（默认 <out>/replay.jsonl）。已在里面的样本"
+             "直接复用，不再发起调用——续跑不重复花钱。",
+    )
     args = parser.parse_args()
 
     if not Path(args.db).exists():
@@ -148,6 +274,30 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     detail = out / "rounds.jsonl"
 
+    # 逐样本检查点。装在服务已经构造好的引擎上，因为服务层才知道
+    # llm_config —— 探针自己没有重建 reviewer 的信息。引擎的 reviewer_factory
+    # 是 None 时（没配 LLM）什么都不包：那种情况下压根不会发生回放。
+    checkpoint = None
+    if service.evolution.reviewer_factory is not None:
+        checkpoint = ReplayCheckpoint(
+            Path(args.checkpoint) if args.checkpoint else out / "replay.jsonl"
+        )
+        replayed = [0]
+
+        def progress(kind: str, key: str, elapsed: float, findings: int) -> None:
+            replayed[0] += 1
+            print(json.dumps({
+                "replay": replayed[0], "kind": kind, "key": key[:12],
+                "elapsed_ms": int(elapsed * 1000), "findings": findings,
+            }, ensure_ascii=False), flush=True)
+
+        service.evolution.reviewer_factory = checkpointing_factory(
+            service.evolution.reviewer_factory, checkpoint, progress
+        )
+        print(json.dumps({
+            "checkpoint": str(checkpoint.path), "preloaded": len(checkpoint.cache),
+        }, ensure_ascii=False), flush=True)
+
     config = {
         "db": args.db,
         "skill": args.skill,
@@ -167,12 +317,15 @@ def main() -> int:
     rounds = []
     for index in range(1, args.rounds + 1):
         before = snapshot(store, args.skill)
+        replay_before = (checkpoint.hits + checkpoint.misses) if checkpoint else 0
         try:
             result = service.evolution.auto_propose(args.skill, settings.default_tenant_id)
         except Exception as exc:                     # noqa: BLE001
             # 崩了也要落盘：崩溃本身是这次探测的结果之一，而重跑一轮很贵。
             record = {
                 "round": index, "before": before,
+                "replays": (checkpoint.hits + checkpoint.misses - replay_before)
+                           if checkpoint else None,
                 "error": "%s: %s" % (type(exc).__name__, exc),
             }
             rounds.append({"round": index, "digest": {}, "error": record["error"]})
@@ -187,6 +340,10 @@ def main() -> int:
             "round": index,
             "before": before,
             "after": snapshot(store, args.skill),
+            # 这一轮里有多少次回放是真花了钱的。续跑时 fresh 会明显小于总数。
+            "replays": (checkpoint.hits + checkpoint.misses - replay_before)
+                       if checkpoint else None,
+            "replay_cache_hits": checkpoint.hits if checkpoint else None,
             "digest": digest(result),
             "result": result,
         }
