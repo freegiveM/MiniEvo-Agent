@@ -438,7 +438,10 @@ Skill 自进化与提示词进化是两套独立版本链。系统不会把反�
 
 - `EVOAGENT_EVAL_MIN_CASES`：验证集最少样本数；
 - `EVOAGENT_EVAL_MIN_HOLDOUT_CASES`：隐藏集最少样本数；
-- `EVOAGENT_EVAL_MAX_CASES`：每个数据分区单次最多回放样本数；
+- `EVOAGENT_EVAL_MAX_CASES`：每个数据分区单次最多回放样本数，默认 `20`。
+  这个数直接决定每个受保护指标的分母——个位数下 `severity_accuracy` 的分母
+  是 2 或 3，一条样本动 33 个百分点，门禁量到的主要是噪声。调低能省钱，
+  省下的正是门禁的分辨力。单轮回放次数是 `4 × 该值`；
 - `EVOAGENT_EVAL_MIN_IMPROVEMENT`：验证集最小分数提升；
 - `EVOAGENT_EVAL_MAX_METRIC_REGRESSION`：受保护指标允许的最大退化，默认 `0`。
 

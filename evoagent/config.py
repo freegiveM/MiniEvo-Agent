@@ -139,7 +139,22 @@ class Settings:
     # 抬高的代价是单轮成本上升，但产不出候选的调用是纯浪费——它同样按
     # 6000 token 计费，只是什么都没换回来。
     evolution_generator_token_budget: int = 16000
-    eval_max_cases: int = 5
+    # 每个切分单轮回放的样本上限。
+    #
+    # 默认从 5 抬到 20：**5 条下受保护指标的分母只有个位数,门禁量到的
+    # 主要是噪声**。实测 validation 在 limit=5 时取出 3 缺陷 + 2 干净,于是
+    # `severity_accuracy` 的分母是 2 或 3——一条样本就动 33 个点,
+    # `clean_accuracy` 的步长是 0.5,Wilson 区间宽到几乎任何两个候选都
+    # "不显著"。回路 B 第一轮那次 1.0 → 0.667 的"回退"就是这么来的。
+    #
+    # 20 是按分层取样的实际形状挑的:validation 10 缺陷 + 10 干净,
+    # holdout 18 缺陷 + 2 干净,两个方向的分母都进入两位数。再往上抬收益
+    # 递减而成本线性涨——单轮回放次数是 `4 × max_cases`(两个切分 ×
+    # baseline/candidate),20 就是每轮 80 次 LLM 调用。
+    #
+    # 库存不是瓶颈(validation 23 缺陷 + 65 干净,holdout 110 + 16),这个
+    # 数纯粹是预算取舍,所以留在环境变量里可调。
+    eval_max_cases: int = 20
     eval_min_cases: int = 3
     eval_min_improvement: float = 0.01
     eval_min_holdout_cases: int = 2
@@ -348,7 +363,7 @@ class Settings:
                 os.getenv("EVOAGENT_EVOLUTION_PARENT_EPSILON", "0.1")),
             evolution_generator_token_budget=_int(
                 "EVOAGENT_EVOLUTION_GENERATOR_TOKEN_BUDGET", 16000),
-            eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 5),
+            eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 20),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),
             eval_min_holdout_cases=_non_negative_int("EVOAGENT_EVAL_MIN_HOLDOUT_CASES", 2),

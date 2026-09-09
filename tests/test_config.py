@@ -1,4 +1,5 @@
 import dataclasses
+import inspect
 import os
 import tempfile
 import unittest
@@ -87,3 +88,48 @@ class GeneratorTokenBudgetTests(unittest.TestCase):
             self._settings(
                 evolution_generator_token_budget=16000
             ).validate_evolution()
+
+
+class EvalCaseBudgetTests(unittest.TestCase):
+    """单轮回放的样本上限决定了每个受保护指标的分母。
+
+    默认值曾经是 5。分层取样在 limit=5 下取出 3 缺陷 + 2 干净，于是
+    `severity_accuracy` 的分母是 2 或 3、`clean_accuracy` 的步长是 0.5——
+    一条样本动 33 个点，Wilson 区间宽到几乎任何两个候选都判不出显著。
+    门禁那时量的主要是噪声，而 `passed: true` 与真的没退化长得一模一样。
+
+    库存不是瓶颈（validation 23 缺陷 + 65 干净），这纯粹是预算取舍。
+    """
+
+    def test_the_default_gives_each_protected_metric_a_two_digit_denominator(self):
+        """**本组最要紧的断言。** 20 条下 validation 取 10 缺陷 + 10 干净。
+
+        往回调到个位数是能省钱，但省下来的那部分正是门禁的分辨力。要调
+        请显式设 `EVOAGENT_EVAL_MAX_CASES`，别改默认值。
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertGreaterEqual(Settings.from_env().eval_max_cases, 20)
+
+    def test_it_is_configurable_from_the_environment(self):
+        """成本敏感的部署仍可调低——代价要由调的人显式承担。"""
+        with patch.dict(
+            os.environ, {"EVOAGENT_EVAL_MAX_CASES": "8"}, clear=True,
+        ):
+            self.assertEqual(8, Settings.from_env().eval_max_cases)
+
+    def test_the_engine_default_matches_the_settings_default(self):
+        """引擎自己的默认值也得跟着走。
+
+        服务层会用 settings 覆盖，但直接构造引擎的调用点（探针脚本、
+        证明脚本）吃的是构造函数默认值。两处不一致时，同一个仓库里会出现
+        两种分母，而报告上看不出用的是哪一种。
+        """
+        from evoagent.evolution import EvolutionEngine
+
+        with patch.dict(os.environ, {}, clear=True):
+            expected = Settings.from_env().eval_max_cases
+        self.assertEqual(
+            expected,
+            inspect.signature(EvolutionEngine.__init__)
+            .parameters["max_cases"].default,
+        )

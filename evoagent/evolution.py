@@ -400,7 +400,7 @@ class EvolutionEngine:
 
     def __init__(
         self, store, reviewer_factory: Optional[Callable[[str], object]] = None,
-        min_cases: int = 3, max_cases: int = 5, min_improvement: float = 0.01,
+        min_cases: int = 3, max_cases: int = 20, min_improvement: float = 0.01,
         min_holdout_cases: int = 0, max_metric_regression: float = 0.0,
         seed_defaults: bool = True, candidate_generator=None,
         root_cause_min_occurrences: int = 1,

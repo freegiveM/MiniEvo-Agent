@@ -1245,8 +1245,10 @@ high_severity_recall 1.0` 两侧完全一致，`significant: false`。候选没�
 
 - **回路 B / C 依旧不存在。** 候选被 `validation_improvement` 拒了，没有
   任何候选通过门禁。这一轮证明的是**门禁在正确工作**，不是候选变好了。
-- `max_cases=5`（默认）下 validation 只取 5 条、clean 2 条。第 19.4 节
-  测的 20 条是 `max_cases=20` 的形状，两者不能混着读。
+- 这一轮跑在 `max_cases=5`（当时的默认）下，validation 只取 5 条、clean
+  2 条。第 19.4 节测的是 `max_cases=20` 的形状，两者不能混着读。
+  **默认值此后已抬到 20**（理由见下），所以这一轮的分母不能拿来读今天的
+  门禁行为。
 - 第 13 节 G 的 Pareto 现在**具备了前置条件**：档案里有两个带分数的版本
   （0.6049 / 0.6375）。但两个版本还不够谈 Pareto 前沿。
 - 探针脚本第一版把门禁键名写成 `improved` / `non_regression`（真实键名是
