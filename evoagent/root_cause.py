@@ -29,6 +29,18 @@
 轨道 F 的 val 晋升条件是"同一根因出现次数超过阈值"，用的必须是这里
 同一个 `fingerprint()`。两处各写一份实现，就会出现"进 val 的标准"和
 "触发候选生成的标准"悄悄分叉。
+
+## 改动归一化规则会静默重置重试上限
+
+指纹现算、不落库（见上一节），但 `evolution_attempts.fingerprint` 里存的
+是**当时那次算出来的键**。所以任何改动 `normalize_path` 或 category 取值
+的行为，都会让受影响的根因在账本里查不到历史，`max_attempts_per_root_cause`
+的计数从 0 重新开始。账本没坏——它如实记录了当时的算法——但后果是那些
+根因会多获得几次重试机会。
+
+已发生过一次：2026-09-09 去掉了收尾的 `lstrip("./")`（详见
+`normalize_path` 的文档串）。受影响的只有以 `.` 开头的路径和含 `..` 的
+路径，当时账本量级在两位数，影响可忽略。以后再动这里，把变更记在这一节。
 """
 import hashlib
 import posixpath
@@ -36,19 +48,35 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 
-# 路径归一化：统一分隔符、去掉 ./ 前缀、小写化。不做更激进的归一化
+# 路径归一化：统一分隔符、消掉 ./ 与 ../、小写化。不做更激进的归一化
 # （比如剥掉目录只留文件名）——`a/utils.py` 和 `b/utils.py` 是两个文件，
 # 合并它们会把不相关的缺陷算进同一个桶，从而虚高计数并让阈值提前达标。
 _SEPARATORS = re.compile(r"[\\/]+")
 
 
 def normalize_path(path: str) -> str:
-    """把仓库内路径归一化到可比较的形式。"""
+    """把仓库内路径归一化到可比较的形式。
+
+    ## 为什么不用 `lstrip("./")` 去前导
+
+    这里曾经以 `value.lstrip("./")` 收尾。`lstrip` 的参数是**字符集合**
+    而不是前缀，所以它会把开头所有的 `.` 和 `/` 逐个剥掉：
+    `.github/workflows/ci.yml` 变成 `github/workflows/ci.yml`，`.env`
+    变成 `env`。点文件在 PR diff 里很常见（`.github/` 尤其），而
+    `describe()` 用的是同一个函数，于是报告和日志里的路径与仓库里的
+    真实路径对不上。更坏的情况是仓库里真有一个 `env` 或 `github/`
+    目录——那时两个不相关的根因会共用一个桶和一份重试计数。
+
+    `posixpath.normpath` 已经消掉了 `./`，所以那一步本来只是兜底，
+    去掉它不会让 `./a/b.py` 漏归一化。`../a.py` 现在保留 `..` 而不再被
+    削成 `a.py`：一个指向仓库外的路径与仓库内的同名文件不是一回事，
+    合并它们与上面那条"不剥目录"的理由相同。
+    """
     value = _SEPARATORS.sub("/", str(path or "").strip())
     value = posixpath.normpath(value) if value else ""
     if value in {".", "/"}:
         return ""
-    return value.lstrip("./").lower()
+    return value.lower()
 
 
 def fingerprint(

@@ -53,6 +53,32 @@ class NormalizePathTests(unittest.TestCase):
         for raw in ("", "   ", ".", "/", None):
             self.assertEqual("", normalize_path(raw))
 
+    def test_a_leading_dot_in_a_filename_survives(self):
+        """点文件的前导点不能被吃掉。
+
+        这里曾经以 `lstrip("./")` 收尾，而 `lstrip` 的参数是字符集合而不是
+        前缀，于是 `.github/workflows/ci.yml` 被削成 `github/workflows/ci.yml`、
+        `.env` 被削成 `env`。两个后果：`describe()` 用同一个函数，报告里的
+        路径与仓库里的真实路径对不上；仓库里真有 `env` 或 `github/` 时，两个
+        不相关的根因会共用一个桶和一份重试计数。
+        """
+        self.assertEqual(".github/workflows/ci.yml",
+                         normalize_path(".github/workflows/ci.yml"))
+        self.assertEqual(".env", normalize_path(".env"))
+        self.assertNotEqual(normalize_path(".env"), normalize_path("env"))
+
+    def test_dot_slash_is_still_stripped(self):
+        """去掉 lstrip 之后 `./` 仍然要被消掉——那是 normpath 的活。"""
+        self.assertEqual("a/b.py", normalize_path("./a/b.py"))
+        self.assertEqual("a/b.py", normalize_path("./a/./b.py"))
+
+    def test_a_path_escaping_the_repo_is_not_merged_with_one_inside(self):
+        """`../a.py` 与 `a.py` 不是同一个文件。
+
+        与"不剥目录只留文件名"同因：合并它们会把不相关的缺陷算进同一个桶。
+        """
+        self.assertNotEqual(normalize_path("../a.py"), normalize_path("a.py"))
+
 
 class FingerprintTests(unittest.TestCase):
     def test_the_same_root_cause_written_differently_is_one_bucket(self):
