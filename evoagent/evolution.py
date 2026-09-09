@@ -791,8 +791,25 @@ class EvolutionEngine:
     #
     # 这里用白名单而不是黑名单：将来新增一个推断类别时，默认是被排除，
     # 而不是默认混进来。默认值的方向决定了忘记改这里的后果。
+    #
+    # `execution_error` **不在**这里，尽管它曾经在。它由
+    # `harness.py` 的 `except Exception` 兜底写入，没有任何人参与——白名单
+    # 挡的是 category 字面值，对"这个 category 背后有没有人"一无所知，所以
+    # 它当初是靠字面值混进来的。两个具体后果：
+    #
+    # 1. 一次崩溃（超时、provider 挂了、JSON 截断）会被当成人工确认的评审
+    #    缺陷去改提示词，而这类故障与提示词内容无关。
+    # 2. 它的 payload 没有 `finding`，`fingerprint_case` 会退化成只含
+    #    category 的指纹，于是**所有**执行错误无论异常、仓库、文件全部塌进
+    #    同一个桶。那个桶最快撞上 `max_attempts_per_root_cause`，把彼此无关
+    #    的故障一起标成 exhausted。
+    #
+    # `case_promotion.REFUSED_CATEGORIES` 早就以同样的理由拒绝它进评测集
+    # （"an execution error is an outage, not a review defect"）；这里与那边
+    # 现在口径一致。执行错误仍然落盘、仍然计数、仍可人工分诊，只是不再自己
+    # 改提示词。
     HUMAN_CONFIRMED_CATEGORIES = frozenset({
-        "false_positive", "missed_issue", "bad_fix", "accepted", "execution_error",
+        "false_positive", "missed_issue", "bad_fix", "accepted",
     })
 
     def _select_cases(self, skill_name: str, all_cases: List[dict]) -> Dict[str, Any]:
@@ -972,8 +989,12 @@ class EvolutionEngine:
             directives.append("Check boundary conditions, authorization, input validation and error paths explicitly.")
         if counts.get("bad_fix"):
             directives.append("Propose minimal fixes that preserve behavior and always include a regression test.")
-        if counts.get("execution_error"):
-            directives.append("Keep output valid JSON and follow the requested schema exactly.")
+        # 这里曾经有一条 `execution_error` 的 directive（"Keep output valid
+        # JSON..."）。`cases` 是 `_select_cases` 过滤后的结果，而
+        # `execution_error` 已不在 `HUMAN_CONFIRMED_CATEGORIES` 里（理由见那
+        # 里），所以那个 counts 键永远为空，条件永远不成立。删掉而不是留着：
+        # 一条不可达的分支会让后来的人以为执行错误仍在驱动提示词，从而在排查
+        # "崩溃为什么没改进提示词"时找错方向。
         # A missed-issue feedback item may carry the reviewer rule identifier that a
         # human confirmed.  Preserve that signal in the prompt without accepting
         # arbitrary feedback text as an instruction.  The bracketed marker is both

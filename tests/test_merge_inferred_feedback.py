@@ -247,6 +247,24 @@ class ConsumptionTests(_Base):
         )
         self.assertIn("missed_issue", EvolutionEngine.HUMAN_CONFIRMED_CATEGORIES)
 
+    def test_an_execution_error_does_not_drive_prompt_evolution(self):
+        """`execution_error` 由 `harness.py` 的 `except Exception` 兜底写入。
+
+        它曾经在白名单里，靠的是白名单只看 category 字面值、看不出这个
+        category 背后有没有人。两个后果：
+
+        1. 一次崩溃（超时、provider 挂了、JSON 截断）被当成人工确认的评审
+           缺陷去改提示词，而这类故障与提示词内容无关。
+        2. 它的 payload 没有 `finding`，指纹退化成只含 category，于是所有
+           执行错误无论异常、仓库、文件全部塌进同一个桶，最快撞上重试上限
+           并把彼此无关的故障一起标成 exhausted。
+
+        `case_promotion.REFUSED_CATEGORIES` 早就以同样的理由拒绝它进评测集。
+        """
+        self.assertNotIn(
+            "execution_error", EvolutionEngine.HUMAN_CONFIRMED_CATEGORIES,
+        )
+
     def test_the_counts_separate_inferred_from_human_sources(self):
         """报数时两种来源必须分开看，合成一个"未解决反馈数"没有意义。"""
         review = self._reviewed_pr()

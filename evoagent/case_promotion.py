@@ -72,6 +72,12 @@ REFUSED_CATEGORIES = {
         "an accepted review is not a defect signal; promoting it would add a "
         "sample with no expectation to check"
     ),
+    # 2026-09-09 起 `execution_error` 已不在 `HUMAN_CONFIRMED_CATEGORIES`
+    # 里（理由见 `evolution.py` 那个常量的注释），所以 `promote_case` 会在
+    # 前一道 `category not in CONFIRMED` 就拦住它，这条理由拿不到。
+    # 保留而不是删除：这两道门的判据不同——上面那道问"这个类别背后有没有
+    # 人"，这条问"这个类别提升进评测集有没有意义"。答案独立为真，且如果
+    # 以后有人把 `execution_error` 放回白名单，这条就是第二道防线。
     "execution_error": (
         "an execution error is an outage, not a review defect; the harness "
         "already counts failed replays as missed positives"
