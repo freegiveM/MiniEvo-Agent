@@ -37,3 +37,8 @@ datasets/.diff-cache/
 # 判据是"有没有生成不出来的人工判断"，不是文件名长什么样。
 # 一旦某份候选清单标完了，它该改名成 `labelling-*.json` 入库。
 datasets/feedback-candidates-*.json
+
+# 上游同类项目的可迁移性评估：**不入库**。它引用的三个外部仓库 clone 在
+# 本仓库之外，文中大量篇幅是对它们的评价与本项目的内部取舍，属于开发过程
+# 记录而非项目文档。留在本地即可。
+docs/upstream-transferability.md
