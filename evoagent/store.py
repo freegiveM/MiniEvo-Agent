@@ -176,6 +176,29 @@ class TaskStore:
                 "CREATE INDEX IF NOT EXISTS idx_evolution_attempts_fingerprint "
                 "ON evolution_attempts(skill_name, fingerprint, created_at)"
             )
+            # 这次尝试是**对着哪个基线**打的分。没有它，一条针对 v1 提示词
+            # 被拒的记录会在提示词走到 v6 之后继续被当成反思信号回传——那条
+            # "别再这么改"的结论是在一个已经不存在的基线上得出的，现在很可能
+            # 已经不成立。`_prior_attempts` 用它把陈旧记录筛掉。
+            #
+            # 只筛反思信号，**不筛重试计数**：
+            # `count_attempts_by_fingerprint` 照旧数全部历史。如果重试上限
+            # 也跟着基线过期，每次激活都会给同一个根因刷新 3 次机会，那道
+            # 上限就等于不存在——又一道假装在工作的门禁。
+            #
+            # 旧行是 NULL：无法归属基线的记录不进反思信号，不猜。
+            self._ensure_column(conn, "evolution_attempts", "baseline_version", "INTEGER")
+            # 这次尝试**具体改了什么**，以及分数怎么变的。
+            #
+            # 原先账本只存 decision + reason，于是回传给生成器的信号是
+            # "这个根因上次被拒了，理由是某项受保护指标回退"——它说明不了
+            # 上次试的是**哪个**改法，生成器完全可能再提一遍等价的修改，
+            # 而门禁会再拒一次，把重试上限烧完。SkillOpt 的 step buffer
+            # （trainer.py 的 `_format_step_buffer`）回传的是具体 edits 加
+            # `score_before → score_after`，这里存的是同一份东西。
+            self._ensure_column(
+                conn, "evolution_attempts", "edits_json", "TEXT NOT NULL DEFAULT '{}'"
+            )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS skill_artifact_versions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -989,15 +1012,25 @@ class TaskStore:
     def record_evolution_attempts(
         self, run_id: str, skill_name: str, decision: str, reason: str,
         candidate_version: Optional[int], cases: list,
+        baseline_version: Optional[int] = None,
+        edits: Optional[Dict[str, Any]] = None,
     ) -> int:
         """记账：这批 failure_case 在这次 run 里被尝试过，判决是什么。
 
         `cases` 是 (failure_case_id, fingerprint) 的序列。一次写入一批，
         同一个事务——半批落盘会让下一轮把剩下那半当成"从未尝试过"。
+
+        `baseline_version` 是这次判决对着哪个基线打的分，`edits` 是这次
+        具体改了什么（见建表处那两列的注释）。两者都默认 None/空：调用方
+        没提供时写 NULL 与 `{}`，而 `list_reflection_attempts` 会把
+        baseline 为 NULL 的行排除在反思信号之外——猜一个基线号的后果是把
+        陈旧结论当成当前有效的，那比没有信号更坏。
         """
         rows = [
             (run_id, skill_name, int(case_id), str(fingerprint), decision,
-             str(reason or "")[:1000], candidate_version, utc_now())
+             str(reason or "")[:1000], candidate_version, utc_now(),
+             baseline_version,
+             json.dumps(edits or {}, ensure_ascii=False))
             for case_id, fingerprint in cases
         ]
         if not rows:
@@ -1005,8 +1038,9 @@ class TaskStore:
         with self._lock, self._connect() as conn:
             conn.executemany(
                 "INSERT INTO evolution_attempts(run_id,skill_name,failure_case_id,"
-                "fingerprint,decision,reason,candidate_version,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "fingerprint,decision,reason,candidate_version,created_at,"
+                "baseline_version,edits_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
         return len(rows)
@@ -1030,6 +1064,12 @@ class TaskStore:
 
         用于 DGM 式的选亲：一个反复尝试反复失败的根因，说明"改提示词"
         这个动作对它无效，不该无限重试。
+
+        **不按 baseline_version 过滤，这是刻意的。** 反思信号会随基线过期
+        （见 `list_reflection_attempts`），重试计数不会：这个数回答的是
+        "在这个根因上一共花过多少次全量回放"，那笔钱不会因为提示词换了版本
+        就退回来。跟着基线过期的话，每激活一个新版本就等于给所有根因重置
+        额度，`max_attempts_per_root_cause` 名存实亡。
         """
         with self._connect() as conn:
             rows = conn.execute(
@@ -1045,6 +1085,38 @@ class TaskStore:
                 "SELECT * FROM evolution_attempts WHERE skill_name = ? "
                 "ORDER BY id DESC LIMIT ?",
                 (skill_name, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_reflection_attempts(
+        self, skill_name: str, baseline_version: Optional[int], limit: int = 200,
+    ) -> list:
+        """还**能当反思信号**用的账本行：只取同一基线上打的分。
+
+        与 `list_evolution_attempts` 的区别不是过滤条件的松紧，是用途：
+        那个方法是审计视图（全部历史，谁都不该被藏起来），这个是喂回生成器
+        的信号。一条针对 v1 提示词被拒的记录，在提示词走到 v6 之后已经不是
+        证据了——"别再这么改"是在一个不存在的基线上得出的结论，当前基线里
+        可能压根没有那段文本。继续回传它有两个坏处：挤占 token 预算，以及
+        把生成器往一个已经无效的禁区上引。
+
+        `baseline_version` 为 None 时（第一轮，还没有 active 版本）返回空：
+        没有基线就没有"同一基线"可言。行上 `baseline_version` 为 NULL 的
+        （本列加入之前写的老行）同样不返回——它们归属不到任何基线，当成
+        当前有效会把陈旧结论伪装成新鲜的。
+
+        **这个过滤绝不影响重试上限。** `count_attempts_by_fingerprint`
+        照旧数全部历史行。见建表处那段注释：让上限也跟着基线过期，等于
+        每次激活刷新一次重试额度，那道门禁就名存实亡了。
+        """
+        if baseline_version is None:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM evolution_attempts "
+                "WHERE skill_name = ? AND baseline_version = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (skill_name, int(baseline_version), max(1, min(limit, 1000))),
             ).fetchall()
         return [dict(row) for row in rows]
 

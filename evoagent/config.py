@@ -117,6 +117,22 @@ class Settings:
     # 同一个根因指纹最多被尝试几次。反复尝试反复失败说明"改提示词"对这
     # 类根因无效，不该无限重试烧钱。0 = 不限制。
     evolution_max_attempts_per_root_cause: int = 3
+    # 单轮最多回传几条历史尝试当反思信号。
+    #
+    # 回传数不设上限时，账本会随轮次单调增长，而它整条塞进候选生成那一次
+    # 调用的输入里。`evolution_generator_token_budget` 封的是**输出**
+    # （max_tokens），封不住输入——所以后果不是报错，是反思信号把输入撑大，
+    # 挤掉真正要看的 `failure_cases` 和 `active_prompt`，而且看不出来。
+    #
+    # 默认 12：`_prior_attempts` 原先硬编码在生成器里的上限是 20
+    # （`evolution_v2.generate` 的 `[:20]`），那个数字没有依据且切在错误的
+    # 层——生成器拿到什么由调用方决定，不该由生成器自己截。取 12 是因为
+    # 同一基线上能积累的尝试数受 `max_attempts_per_root_cause` 约束，单轮
+    # 根因数通常是个位数，12 条足够覆盖而不至于挤占预算。
+    #
+    # 排序在 `_prior_attempts` 里：先按"这个根因试过几次"降序（试得最多的
+    # 最该被劝阻），再按时间倒序。截断时报出丢了几条，不静默切。
+    evolution_max_reflection_attempts: int = 12
     # 下一轮从哪个提示词版本改起。"active" | "best" | "pareto" |
     # "epsilon_greedy"，见 evoagent/archive.py。
     #
@@ -357,6 +373,8 @@ class Settings:
                 "EVOAGENT_EVOLUTION_ROOT_CAUSE_MIN_OCCURRENCES", 1),
             evolution_max_attempts_per_root_cause=_non_negative_int(
                 "EVOAGENT_EVOLUTION_MAX_ATTEMPTS_PER_ROOT_CAUSE", 3),
+            evolution_max_reflection_attempts=_non_negative_int(
+                "EVOAGENT_EVOLUTION_MAX_REFLECTION_ATTEMPTS", 12),
             evolution_parent_strategy=os.getenv(
                 "EVOAGENT_EVOLUTION_PARENT_STRATEGY", "active").strip() or "active",
             evolution_parent_epsilon=float(

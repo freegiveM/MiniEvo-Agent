@@ -173,29 +173,140 @@ class MemoryRecallTests(_Base):
 
 
 class PriorAttemptTests(_Base):
+    def _record(self, case, baseline_version, run_id="run-1", case_id=1, **kwargs):
+        from evoagent.root_cause import fingerprint_case
+        payload = {
+            "decision": "rejected", "reason": "holdout recall regressed",
+            "candidate_version": 3,
+        }
+        payload.update(kwargs)
+        return self.store.record_evolution_attempts(
+            run_id, "llm-review", payload["decision"], payload["reason"],
+            payload["candidate_version"], [(case_id, fingerprint_case(case))],
+            baseline_version=baseline_version, edits=payload.get("edits"),
+        )
+
     def test_past_verdicts_are_fed_back_to_the_generator(self):
         """被拒的候选必须让下一轮知道，否则会反复提等价修改。"""
-        from evoagent.root_cause import fingerprint_case
-        self.store.record_evolution_attempts(
-            "run-1", "llm-review", "rejected", "holdout recall regressed", 3,
-            [(1, fingerprint_case(self._case()))],
-        )
+        self._record(self._case(), 3)
         engine = EvolutionEngine(self.store, seed_defaults=False)
-        prior = engine._prior_attempts("llm-review", [self._case()])
+        prior = engine._prior_attempts("llm-review", [self._case()], 3)
 
-        self.assertEqual(1, len(prior))
-        self.assertEqual("rejected", prior[0]["decision"])
-        self.assertIn("holdout", prior[0]["reason"])
+        self.assertEqual(1, len(prior["attempts"]))
+        self.assertEqual("rejected", prior["attempts"][0]["decision"])
+        self.assertIn("holdout", prior["attempts"][0]["reason"])
+        self.assertEqual(0, prior["dropped"])
 
     def test_unrelated_root_causes_are_not_fed_back(self):
         """无关根因的失败记录挤占预算，且易被误读成"这个方向也别碰"。"""
-        from evoagent.root_cause import fingerprint_case
-        self.store.record_evolution_attempts(
-            "run-1", "llm-review", "rejected", "unrelated failure", 3,
-            [(9, fingerprint_case(self._case(rule_id="SEC-SQL", path="z.py")))],
-        )
+        self._record(self._case(rule_id="SEC-SQL", path="z.py"), 3, case_id=9)
         engine = EvolutionEngine(self.store, seed_defaults=False)
-        self.assertEqual([], engine._prior_attempts("llm-review", [self._case()]))
+        prior = engine._prior_attempts("llm-review", [self._case()], 3)
+        self.assertEqual([], prior["attempts"])
+        self.assertEqual(0, prior["considered"])
+
+    def test_a_verdict_from_an_older_baseline_is_withheld(self):
+        """针对 v1 被拒的结论，在提示词走到 v6 之后不再是证据。
+
+        那条"别这么改"是相对一个已经不存在的基线得出的——当前基线里可能
+        压根没有那段文本。继续回传它既挤占预算，又把生成器往一个已经无效的
+        禁区上引。
+        """
+        self._record(self._case(), 1)
+        engine = EvolutionEngine(self.store, seed_defaults=False)
+        self.assertEqual(
+            [], engine._prior_attempts("llm-review", [self._case()], 6)["attempts"],
+        )
+        # 同一行在它自己的基线上仍然是有效证据——过期是相对的，不是删除。
+        self.assertEqual(
+            1, len(engine._prior_attempts("llm-review", [self._case()], 1)["attempts"]),
+        )
+
+    def test_expiry_does_not_refund_the_retry_budget(self):
+        """反思信号会随基线过期，重试计数**不会**。
+
+        跟着过期的话，每激活一个新版本就等于给所有根因重置额度，
+        `max_attempts_per_root_cause` 名存实亡——又一道假装在工作的门禁。
+        """
+        from evoagent.root_cause import fingerprint_case
+        for index in range(3):
+            self._record(self._case(), 1, run_id="run-%d" % index)
+        key = fingerprint_case(self._case())
+        # 基线已经走到 6，反思信号一条都不回传……
+        engine = EvolutionEngine(self.store, seed_defaults=False)
+        self.assertEqual(
+            [], engine._prior_attempts("llm-review", [self._case()], 6)["attempts"],
+        )
+        # ……但那三次全量回放的钱花过了，计数照旧是 3。
+        self.assertEqual(
+            3, self.store.count_attempts_by_fingerprint("llm-review")[key],
+        )
+
+    def test_a_missing_baseline_yields_no_reflection_signal(self):
+        """第一轮还没有 active 版本时没有"同一基线"可言。
+
+        老账本行（本列加入之前写的）的 baseline 是 NULL，同样不回传：
+        它们归属不到任何基线，当成当前有效会把陈旧结论伪装成新鲜的。
+        """
+        self._record(self._case(), None)
+        engine = EvolutionEngine(self.store, seed_defaults=False)
+        self.assertEqual(
+            [], engine._prior_attempts("llm-review", [self._case()], None)["attempts"],
+        )
+        self.assertEqual(
+            [], engine._prior_attempts("llm-review", [self._case()], 3)["attempts"],
+        )
+
+    def test_the_reflection_signal_is_capped_and_the_drop_is_reported(self):
+        """账本随轮次单调增长，而它整条进候选生成的**输入**。
+
+        `token_budget` 封的是输出（max_tokens），封不住输入。所以不设上限的
+        后果不是报错，是反思信号挤掉真正要看的 `failure_cases`，且看不出来。
+        截断条数必须报出：只报送进去的条数会让"这轮只有 2 条历史"和"这轮有
+        40 条但只送了 2 条"长得一样。
+        """
+        for index in range(5):
+            self._record(self._case(), 3, run_id="run-%d" % index)
+        engine = EvolutionEngine(
+            self.store, seed_defaults=False, max_reflection_attempts=2)
+        prior = engine._prior_attempts("llm-review", [self._case()], 3)
+        self.assertEqual(2, len(prior["attempts"]))
+        self.assertEqual(5, prior["considered"])
+        self.assertEqual(3, prior["dropped"])
+
+    def test_the_edits_and_score_delta_travel_with_the_verdict(self):
+        """只给 decision + reason 说明不了上次试的是**哪个**改法。
+
+        生成器完全可能再提一遍等价修改，门禁再拒一次，重试额度就这么烧完。
+        照 SkillOpt 的 step buffer 形状回传具体 edits 加 score_before →
+        score_after。
+        """
+        self._record(self._case(), 3, edits={
+            "edits": ["Require evidence from an added line"],
+            "score_before": 0.62, "score_after": 0.55,
+            "regressed_metrics": ["recall"],
+        })
+        engine = EvolutionEngine(self.store, seed_defaults=False)
+        entry = engine._prior_attempts(
+            "llm-review", [self._case()], 3)["attempts"][0]
+        self.assertEqual(
+            ["Require evidence from an added line"], entry["edits"])
+        self.assertEqual(0.62, entry["score_before"])
+        self.assertEqual(0.55, entry["score_after"])
+        self.assertEqual(["recall"], entry["regressed_metrics"])
+
+    def test_an_unscored_attempt_reports_no_score_rather_than_zero(self):
+        """没跑到评测的尝试与测出 0.0 的尝试意义完全相反。
+
+        填 0 会让生成器以为上次那个改法把分数打到了零，从而绕开一个其实
+        没被检验过的方向。与 `_empty_metrics` 里 CI 用 None 同一条纪律。
+        """
+        self._record(self._case(), 3, edits={"edits": ["something"]})
+        engine = EvolutionEngine(self.store, seed_defaults=False)
+        entry = engine._prior_attempts(
+            "llm-review", [self._case()], 3)["attempts"][0]
+        self.assertNotIn("score_before", entry)
+        self.assertNotIn("score_after", entry)
 
     def test_a_generator_with_the_old_signature_still_works(self):
         """第三方 generator 只接受两个参数时退化，但如实标明没有反思信号。
@@ -203,7 +314,6 @@ class PriorAttemptTests(_Base):
         不标的话，事后会把"生成器不支持"读成"有历史但模型没利用"——
         那是两个完全不同的结论。
         """
-        from evoagent.root_cause import fingerprint_case
 
         class _LegacyGenerator:
             def generate(self, failures, base_prompt):
@@ -214,16 +324,18 @@ class PriorAttemptTests(_Base):
                     "failure_cases": failures,
                 }
 
-        self.store.record_evolution_attempts(
-            "run-1", "llm-review", "rejected", "regressed", 3,
-            [(1, fingerprint_case(self._case()))],
-        )
+        self._record(self._case(), 3, reason="regressed")
         engine = EvolutionEngine(
             self.store, seed_defaults=False, candidate_generator=_LegacyGenerator())
-        generated = engine._generate_candidate("llm-review", [self._case()], "base")
+        generated = engine._generate_candidate(
+            "llm-review", [self._case()], "base", 3)
 
         self.assertEqual([], generated["prior_attempts"])
         self.assertTrue(generated["prior_attempts_unsupported"])
+        # 退化路径同样要报出规模：这一轮**有** 1 条相关历史，只是生成器
+        # 接不了。这两个数放在一起才能得出那个结论。
+        self.assertEqual(1, generated["reflection"]["sent"])
+        self.assertEqual(1, generated["reflection"]["considered"])
 
 
 class IsolationTests(_Base):

@@ -105,6 +105,7 @@ class ReviewService:
             max_metric_regression=settings.eval_max_metric_regression,
             root_cause_min_occurrences=settings.evolution_root_cause_min_occurrences,
             max_attempts_per_root_cause=settings.evolution_max_attempts_per_root_cause,
+            max_reflection_attempts=settings.evolution_max_reflection_attempts,
             parent_strategy=settings.evolution_parent_strategy,
             parent_epsilon=settings.evolution_parent_epsilon,
             candidate_generator=(

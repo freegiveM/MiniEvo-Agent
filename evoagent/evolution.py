@@ -405,6 +405,7 @@ class EvolutionEngine:
         seed_defaults: bool = True, candidate_generator=None,
         root_cause_min_occurrences: int = 1,
         max_attempts_per_root_cause: int = 3,
+        max_reflection_attempts: int = 12,
         parent_strategy: str = "active", parent_epsilon: float = 0.1,
     ):
         self.store = store
@@ -417,6 +418,8 @@ class EvolutionEngine:
         self.candidate_generator = candidate_generator
         self.root_cause_min_occurrences = max(1, int(root_cause_min_occurrences))
         self.max_attempts_per_root_cause = max(0, int(max_attempts_per_root_cause))
+        # 0 = 不截断。与 `max_attempts_per_root_cause` 的 0 同义，口径统一。
+        self.max_reflection_attempts = max(0, int(max_reflection_attempts))
         # 未知策略名不静默回落到 active。回落会让一个拼错的环境变量看起来
         # 完全正常工作，而使用者以为自己开了 pareto。
         if parent_strategy not in archive_module.STRATEGIES:
@@ -591,6 +594,11 @@ class EvolutionEngine:
         baseline_metrics = self._empty_metrics(len(cases))
         candidate_holdout = self._empty_metrics(len(holdout_cases))
         baseline_holdout = self._empty_metrics(len(holdout_cases))
+        # 哪几项受保护指标回退了，结构化形式。原先这个信息只存在于 `reason`
+        # 那句自然语言里，于是想按指标名做事的调用方只能去解析字符串——
+        # `_attempt_edits` 要把它记进账本当反思信号，解析出来的东西会随
+        # 文案改动静默失效。
+        non_regression: Dict[str, Any] = {"validation": {}, "holdout": {}}
         gates = {
             "safety": safety["safety_passed"] and safety["completeness"] == 1.0,
             "validation_dataset_ready": len(cases) >= self.min_cases,
@@ -639,6 +647,9 @@ class EvolutionEngine:
                 candidate_holdout, baseline_holdout)
             validation_safe = validation_report["passed"]
             holdout_safe = holdout_report["passed"]
+            non_regression = {
+                "validation": validation_report, "holdout": holdout_report,
+            }
             gates.update({
                 "evaluation_success": no_errors,
                 "validation_improvement": improved,
@@ -728,6 +739,7 @@ class EvolutionEngine:
             "baseline_holdout": self._redact_holdout_metrics(baseline_holdout),
             "safety": safety,
             "gates": gates,
+            "non_regression": non_regression,
             "run_id": run["id"],
         }
 
@@ -902,8 +914,13 @@ class EvolutionEngine:
                 "strategy": self.parent_strategy, "resolved": "empty_archive",
                 "fell_back_from": "", "parent_version": parent_version,
             }
+        # 门禁基线 = active 版本，见 `_propose` 的文档。账本里的
+        # `baseline_version` 记它而不是 `parent_version`：反思信号该在
+        # "门禁拿来比的那个东西变了"时过期，亲本只决定候选从哪改起。
+        baseline_version = active["version"] if active else None
         if self.candidate_generator is not None and cases:
-            generated = self._generate_candidate(skill_name, cases, base)
+            generated = self._generate_candidate(
+                skill_name, cases, base, baseline_version)
             generated["parent_selection"] = parent_selection
             candidate = generated["candidate_prompt"]
             if candidate.strip() == base.strip():
@@ -919,6 +936,8 @@ class EvolutionEngine:
                 self._record_attempts(
                     None, skill_name, "deferred",
                     "root-cause analysis produced no prompt change", None, cases,
+                    baseline_version=baseline_version,
+                    edits=self._attempt_edits({}, generated),
                 )
                 return {
                     "version": None, "decision": "deferred",
@@ -928,6 +947,7 @@ class EvolutionEngine:
                     "inferred_cases_excluded": excluded,
                     "triage": summary,
                     "feedback_consumed": True,
+                    "reflection": generated["reflection"],
                     "parent_selection": parent_selection, "run_id": None,
                 }
             result = self._propose(
@@ -939,6 +959,10 @@ class EvolutionEngine:
             result["failure_cases_used"] = len(cases)
             result["inferred_cases_excluded"] = excluded
             result["triage"] = summary
+            # 这一轮的反思信号规模。`dropped_over_budget` 非 0 意味着有相关
+            # 历史没送进生成器——那是一条"信号被丢了"的审计线索，必须出现在
+            # 返回值和落盘记录里，否则调不上去也看不出来。
+            result["reflection"] = generated["reflection"]
             result["rollback_point"] = (
                 {"skill_name": skill_name, "version": active["version"]}
                 if active else None
@@ -957,6 +981,8 @@ class EvolutionEngine:
                     result.get("run_id"), skill_name, result["decision"],
                     result.get("reason", ""),
                     (result.get("version") or {}).get("version"), cases,
+                    baseline_version=baseline_version,
+                    edits=self._attempt_edits(result, generated),
                 )
             if result.get("run_id"):
                 runs = self.store.list_evolution_runs(200)
@@ -971,6 +997,7 @@ class EvolutionEngine:
                         "candidate": generated["candidate"],
                         "generation_execution": generated["generation"],
                         "parent_selection": parent_selection,
+                        "reflection": generated["reflection"],
                         "evaluation_data": result["evaluation_data"],
                         "rollback_point": result["rollback_point"],
                         "source_code_changes_allowed": False,
@@ -1040,6 +1067,8 @@ class EvolutionEngine:
                 None, skill_name, "deferred",
                 "no new supported learning signal was found in unresolved feedback",
                 None, cases,
+                baseline_version=baseline_version,
+                edits=self._attempt_edits({}),
             )
             return {
                 "version": None,
@@ -1077,37 +1106,104 @@ class EvolutionEngine:
                 result.get("run_id"), skill_name, result["decision"],
                 result.get("reason", ""),
                 (result.get("version") or {}).get("version"), cases,
+                baseline_version=baseline_version,
+                edits=self._attempt_edits(result),
             )
         if result["decision"] == "activated":
             self.store.resolve_failure_cases([case["id"] for case in cases])
         return result
 
-    def _prior_attempts(self, skill_name: str, cases: List[dict]) -> List[Dict[str, Any]]:
-        """这些根因过去被尝试过什么、门禁怎么判的。
+    def _prior_attempts(
+        self, skill_name: str, cases: List[dict],
+        baseline_version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """这些根因过去被尝试过什么、门禁怎么判的、具体改了什么。
 
         喂回生成器，让它知道自己上一轮失败在哪。没有这个信号，生成器对
         自己的历史一无所知，会反复提出等价的修改——GEPA
         （arXiv:2507.19457）的核心观察正是：把判决以自然语言反馈回生成
         器，信息量远大于只给一个标量分数。
 
-        只回传与**本轮根因相关**的尝试，不是全部历史：无关根因的失败记录
-        挤占 token 预算，且容易被模型误读成"这个方向也别碰"。
+        三道过滤，每一道对应一个具体的失效模式：
+
+        1. **根因相关**。只回传与本轮根因相关的尝试。无关根因的失败记录
+           挤占 token 预算，且容易被模型误读成"这个方向也别碰"。
+        2. **同一基线**（`list_reflection_attempts`）。针对 v1 被拒的记录
+           在提示词走到 v6 之后不再是证据——那条"别这么改"是在一个已经
+           不存在的基线上得出的。`baseline_version` 为 None 时这一层返回
+           空，于是整个反思信号为空：没有基线就没有"同一基线"。
+        3. **条数上限**。账本随轮次单调增长，而它整条进候选生成的**输入**。
+           `token_budget` 封的是输出，封不住输入，所以后果不是报错，是反思
+           信号挤掉真正要看的 `failure_cases`，且看不出来。
+
+        排序在截断之前：先按"这个根因一共试过几次"降序——试得最多的那个
+        最接近重试上限，最该被劝阻——再按账本行倒序（新的在前）。截断掉的
+        条数如实报出，静默切会让"信号回传了 12 条"和"其实有 40 条"长得
+        一样。
+
+        返回 `{attempts, considered, dropped, baseline_version}` 而不是
+        裸列表：调用方要把 `dropped` 写进落盘记录，那是一条"这轮有信号没
+        用上"的审计线索。
         """
         keys = {fingerprint_case(case) for case in cases}
-        prior = []
-        for row in self.store.list_evolution_attempts(skill_name, 200):
-            if row.get("fingerprint") not in keys:
-                continue
-            prior.append({
-                "root_cause_fingerprint": row.get("fingerprint"),
-                "decision": row.get("decision"),
-                "reason": row.get("reason"),
-                "candidate_version": row.get("candidate_version"),
-            })
-        return prior
+        attempt_counts = self.store.count_attempts_by_fingerprint(skill_name)
+        rows = [
+            row for row in self.store.list_reflection_attempts(
+                skill_name, baseline_version, 200)
+            if row.get("fingerprint") in keys
+        ]
+        # 稳定排序：试得最多的根因优先，同一根因内新的优先。account 行的 id
+        # 单调递增，所以直接按它倒序即可，不用解析时间戳。
+        rows.sort(
+            key=lambda row: (
+                attempt_counts.get(str(row.get("fingerprint")), 0),
+                int(row.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        cap = self.max_reflection_attempts
+        kept = rows[:cap] if cap else rows
+        return {
+            "attempts": [self._reflection_entry(row) for row in kept],
+            "considered": len(rows),
+            "dropped": len(rows) - len(kept),
+            "baseline_version": baseline_version,
+        }
+
+    @staticmethod
+    def _reflection_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+        """一条账本行 → 回传给生成器的反思条目。
+
+        `edits` 和 `score_before/after` 来自 `edits_json`。本列加入之前的
+        老行是 `{}`，此时这几个键**不出现**而不是填 0.0：一条没记过分数的
+        尝试与一条测出 0.0 的尝试意义完全不同，填 0 会让生成器以为上次那
+        个改法把分数打到了零。与 `_empty_metrics` 里区间用 None 的理由相同。
+
+        条目形状照 SkillOpt 的 step buffer（`trainer.py` 的
+        `_format_step_buffer`）：具体 edits 加 `score_before → score_after`。
+        只给 decision + reason 说明不了上次试的是**哪个**改法，生成器可以
+        再提一遍等价修改，门禁再拒一次，重试额度就这么烧完。
+        """
+        entry: Dict[str, Any] = {
+            "root_cause_fingerprint": row.get("fingerprint"),
+            "decision": row.get("decision"),
+            "reason": row.get("reason"),
+            "candidate_version": row.get("candidate_version"),
+        }
+        try:
+            edits = json.loads(row.get("edits_json") or "{}")
+        except (TypeError, ValueError):
+            edits = {}
+        if not isinstance(edits, dict):
+            edits = {}
+        for key in ("edits", "score_before", "score_after", "regressed_metrics"):
+            if edits.get(key) is not None:
+                entry[key] = edits[key]
+        return entry
 
     def _generate_candidate(
         self, skill_name: str, cases: List[dict], base: str,
+        baseline_version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """调生成器，尽力把过往尝试一起传进去。
 
@@ -1116,15 +1212,28 @@ class EvolutionEngine:
         旧签名，而不是硬要求所有实现都跟着改——但退化时会在返回值里标明
         这一轮**没有**反思信号，避免事后把"生成器不支持"读成"有历史但
         模型没利用"。
+
+        `reflection` 三个数（送进去几条、相关的一共几条、截断掉几条）一律
+        落进返回值。只报送进去的条数会让"这轮只有 2 条历史"和"这轮有 40 条
+        但只送了 12 条"长得一样，而后者意味着信号在被丢弃。
         """
-        attempts = self._prior_attempts(skill_name, cases)
+        reflection = self._prior_attempts(skill_name, cases, baseline_version)
+        attempts = reflection["attempts"]
         try:
-            return self.candidate_generator.generate(cases, base, attempts=attempts)
+            generated = self.candidate_generator.generate(
+                cases, base, attempts=attempts)
         except TypeError:
             generated = self.candidate_generator.generate(cases, base)
             generated.setdefault("prior_attempts", [])
             generated["prior_attempts_unsupported"] = bool(attempts)
-            return generated
+        generated["reflection"] = {
+            "sent": len(attempts),
+            "considered": reflection["considered"],
+            "dropped_over_budget": reflection["dropped"],
+            "baseline_version": reflection["baseline_version"],
+            "max_reflection_attempts": self.max_reflection_attempts,
+        }
+        return generated
 
     @staticmethod
     def _verdict_is_about_the_feedback(result: Dict[str, Any]) -> bool:
@@ -1153,6 +1262,8 @@ class EvolutionEngine:
     def _record_attempts(
         self, run_id: Optional[str], skill_name: str, decision: str, reason: str,
         candidate_version: Optional[int], cases: List[dict],
+        baseline_version: Optional[int] = None,
+        edits: Optional[Dict[str, Any]] = None,
     ) -> None:
         """把这批 case 记进消费账本。
 
@@ -1165,6 +1276,12 @@ class EvolutionEngine:
         **调用方负责先判断这一轮该不该消费**，见
         `_verdict_is_about_the_feedback`。这里不自己判：两个"生成器认为
         无需改动"的调用点根本没有 result 可查，而它们恰恰是该消费的。
+
+        `baseline_version` 存的是**门禁基线**（active 版本），不是
+        `parent_version`。两者在档案选亲下可以不同，而这里要的是前者：
+        反思信号该在"门禁拿来比的那个东西变了"的时候过期，因为那条
+        "别这么改"的结论正是相对它得出的。亲本只影响候选从哪改起，不影响
+        结论还成不成立。
         """
         if not cases:
             return
@@ -1172,7 +1289,49 @@ class EvolutionEngine:
             run_id or ("no-run:%s" % uuid.uuid4()), skill_name, decision, reason,
             candidate_version,
             [(int(case["id"]), fingerprint_case(case)) for case in cases],
+            baseline_version=baseline_version, edits=edits,
         )
+
+    @staticmethod
+    def _attempt_edits(
+        result: Dict[str, Any], generated: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """一次尝试的"改了什么 + 分数怎么变"，落进账本的 `edits_json`。
+
+        缺失的字段**不出现**，不填 0.0。一条没跑到评测的尝试（safety 拒了、
+        provider 没配）与一条测出 0.0 的尝试意义完全相反，填 0 会让下一轮的
+        生成器以为上次那个改法把分数打到了零，从而绕开一个其实没被检验过的
+        方向。与 `_empty_metrics` 里 CI 用 None 的理由相同。
+
+        `edits` 优先取结构化候选的 `prompt_additions`——那是生成器真正提出
+        的改动条目，比整段 diff 可读且短。没有结构化候选时（delta 路径）取
+        `learned_rule_ids`，那是那条路径上实际加进去的东西。
+        """
+        edits: Dict[str, Any] = {}
+        candidate = (generated or {}).get("candidate") or {}
+        additions = candidate.get("prompt_additions")
+        if isinstance(additions, list) and additions:
+            edits["edits"] = [str(item)[:300] for item in additions[:10]]
+        elif result.get("learned_rule_ids"):
+            edits["edits"] = [
+                "add focus-rule %s" % rule_id
+                for rule_id in result["learned_rule_ids"][:10]
+            ]
+        baseline = result.get("baseline") or {}
+        candidate_metrics = result.get("candidate") or {}
+        gates = result.get("gates") or {}
+        # 只在真跑过评测时记分数。`evaluation_success is None` 就是"没跑到
+        # 评测"的判据，与 `_verdict_is_about_the_feedback` 同一条口径。
+        if gates.get("evaluation_success") is not None:
+            edits["score_before"] = baseline.get("score")
+            edits["score_after"] = candidate_metrics.get("score")
+        regressed = []
+        for side in ("validation", "holdout"):
+            report = (result.get("non_regression") or {}).get(side) or {}
+            regressed.extend(report.get("regressed") or [])
+        if regressed:
+            edits["regressed_metrics"] = sorted(set(regressed))
+        return edits
 
     @staticmethod
     def _empty_metrics(case_count: int) -> Dict[str, Any]:
