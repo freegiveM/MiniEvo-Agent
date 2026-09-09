@@ -4,7 +4,7 @@ import math
 import re
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .diff_parser import parse_unified_diff
 from .prompt_rules import (
@@ -358,6 +358,12 @@ class RegressionEvaluator:
                 high_severity_hits, high_severity_total),
             "clean_accuracy_ci": _wilson_interval(clean_hits, clean_total),
             "cases": len(cases),
+            # severity_accuracy 的分子分母。留着比值不留分母，比较就无从知道
+            # 两个比值可不可比——severity_accuracy = severity_hits / matched，
+            # 而 matched 是候选自己挣来的：多抓一条真缺陷，分母就大一格。
+            # 见 `_severity_accuracy_verdict`。
+            "matched": matched,
+            "severity_hits": severity_hits,
             "positive_cases": sum(bool(case.get("expected")) for case in cases),
             "clean_cases": clean_total,
             "expected_findings": expected_total,
@@ -1158,7 +1164,8 @@ class EvolutionEngine:
             # [0.0, 0.0] 会被读成"测过了，确信是 0"。
             "precision_ci": None, "recall_ci": None, "severity_accuracy_ci": None,
             "high_severity_recall_ci": None, "clean_accuracy_ci": None,
-            "cases": case_count, "positive_cases": 0, "clean_cases": 0,
+            "cases": case_count, "matched": 0, "severity_hits": 0,
+            "positive_cases": 0, "clean_cases": 0,
             "expected_findings": 0, "predicted_findings": 0,
             "successful_cases": 0, "success_rate": 0.0, "errors": [], "case_results": [],
         }
@@ -1199,6 +1206,13 @@ class EvolutionEngine:
             )
             for metric in protected
         }
+        # severity_accuracy 的分母由候选自己决定，得单独判。见该方法的文档。
+        incomparable = []
+        if "severity_accuracy" in protected:
+            verdict, note = self._severity_accuracy_verdict(candidate, baseline)
+            verdicts["severity_accuracy"] = verdict
+            if note:
+                incomparable.append(note)
         return {
             "passed": all(verdicts.values()),
             "protected": protected,
@@ -1206,11 +1220,47 @@ class EvolutionEngine:
                 name for name, ok in verdicts.items() if not ok
             ),
             # baseline 侧无定义 = 这一档根本没样本，判定是靠"无从回退"放行的，
-            # 不是靠"确实没退化"。
+            # 不是靠"确实没退化"。分母口径不同的 severity_accuracy 也进这里：
+            # 它同样是"这道门禁这次没验证到什么"，不能与"验证了，没退化"混同。
             "unmeasurable": sorted(
-                metric for metric in protected if baseline.get(metric) is None
+                [metric for metric in protected if baseline.get(metric) is None]
+                + incomparable
             ),
         }
+
+    def _severity_accuracy_verdict(
+        self, candidate: Dict[str, Any], baseline: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """severity_accuracy 的未回退判定：分母不同就不比比值。
+
+        `severity_accuracy = severity_hits / matched`，而 `matched` 是候选
+        **自己挣来的**——多匹配上一条真缺陷，分母就大一格。于是一个把召回
+        从 0.67 提到 1.0 的候选，只要新抓到的那条严重度判低了，比值就从
+        2/2=1.0 掉到 2/3=0.67，被这道门禁判为"回退"。
+
+        它没有把任何一条原本判对的判错。**这道门禁惩罚的是召回率提升**，
+        这正好是进化最该鼓励的方向，也是本仓库反复出现的那类错误的又一
+        变体：一道看着在保护质量、实际在保护现状的门禁。
+
+        所以分母不同时不比比值，改比绝对的 `severity_hits`：没有哪条原本
+        判对严重度的变判错，就不算回退。同时把这一项列进 `unmeasurable`
+        ——比值这次确实没验证，报告里不能显示成"验证了，没退化"。
+
+        分母相同时（候选与 baseline 匹配上同样多的缺陷）比值可比，照常比。
+        """
+        base_matched = baseline.get("matched")
+        cand_matched = candidate.get("matched")
+        # 老 run 的 metrics 里没有 matched（schema 早于本次改动），此时无从
+        # 判断可比性，退回原来的比值判定，不悄悄放宽。
+        if base_matched is None or cand_matched is None or base_matched == cand_matched:
+            return _metric_non_regressing(
+                candidate.get("severity_accuracy"),
+                baseline.get("severity_accuracy"),
+                self.max_metric_regression,
+            ), ""
+        base_hits = int(baseline.get("severity_hits") or 0)
+        cand_hits = int(candidate.get("severity_hits") or 0)
+        return cand_hits >= base_hits, "severity_accuracy"
 
     def _non_regressing(self, candidate: Dict[str, Any], baseline: Dict[str, Any]) -> bool:
         return self._non_regression_report(candidate, baseline)["passed"]

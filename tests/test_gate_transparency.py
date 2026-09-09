@@ -322,5 +322,79 @@ class EvolutionNonRegressionTransparencyTests(unittest.TestCase):
         )
 
 
+class SeverityAccuracyDenominatorTests(EvolutionNonRegressionTransparencyTests):
+    """severity_accuracy 的分母由候选自己决定，比值不能直接对比。
+
+    `severity_accuracy = severity_hits / matched`，`matched` 是候选匹配上的
+    真缺陷数。候选多抓到一条，分母就大一格——于是"召回提升"会自己把这道
+    受保护指标压下去，被判为回退。
+
+    这是本仓库那类错误的又一变体：一道看着在保护质量、实际在保护现状的
+    门禁，而且它惩罚的恰好是进化最该鼓励的方向。
+    """
+
+    @staticmethod
+    def _metrics(**overrides):
+        base = EvolutionNonRegressionTransparencyTests._metrics()
+        base.update({"matched": 2, "severity_hits": 2, "severity_accuracy": 1.0})
+        base.update(overrides)
+        return base
+
+    def test_catching_one_more_defect_is_not_a_severity_regression(self):
+        """**本组最要紧的断言。** 真实形态：loop B 第一轮候选 v3。
+
+        baseline 漏掉一条 missed_issue（matched=2, hits=2 → 1.0）；候选抓到了
+        但严重度判低了（matched=3, hits=2 → 0.667）。没有任何一条原本判对
+        严重度的变判错，绝对命中数持平。
+        """
+        report = self.engine._non_regression_report(
+            self._metrics(matched=3, severity_hits=2, severity_accuracy=0.6667),
+            self._metrics(),
+        )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual([], report["regressed"])
+        # 比值这次没验证到，报告里不能显示成"验证了，没退化"。
+        self.assertEqual(["severity_accuracy"], report["unmeasurable"])
+
+    def test_losing_a_severity_call_still_fails_even_with_a_bigger_denominator(self):
+        """放宽不能宽到"多抓一条就免检"：绝对命中数掉了仍要拦。"""
+        report = self.engine._non_regression_report(
+            self._metrics(matched=3, severity_hits=1, severity_accuracy=0.3333),
+            self._metrics(),
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(["severity_accuracy"], report["regressed"])
+
+    def test_an_equal_denominator_still_compares_the_ratio(self):
+        """分母相同 = 两个比值本来就可比，照原样比，不进 unmeasurable。"""
+        report = self.engine._non_regression_report(
+            self._metrics(severity_hits=1, severity_accuracy=0.5),
+            self._metrics(),
+        )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(["severity_accuracy"], report["regressed"])
+        self.assertEqual([], report["unmeasurable"])
+
+    def test_metrics_without_a_denominator_fall_back_to_the_ratio(self):
+        """老 run 的 metrics 没有 matched 字段，此时无从判断可比性。
+
+        退回原来的比值判定，而不是当作"分母不同"悄悄放宽——放宽一道门禁
+        不能作为读不到字段的副产品发生。
+        """
+        candidate = self._metrics(severity_accuracy=0.5)
+        baseline = self._metrics()
+        for metrics in (candidate, baseline):
+            metrics.pop("matched")
+            metrics.pop("severity_hits")
+
+        report = self.engine._non_regression_report(candidate, baseline)
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(["severity_accuracy"], report["regressed"])
+
+
 if __name__ == "__main__":
     unittest.main()
