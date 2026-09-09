@@ -105,6 +105,42 @@ API 名、不看关键参数**。实测结果：
 [GEPA (arXiv:2507.19457)](https://arxiv.org/html/2507.19457) 的核心
 观察：把判决以自然语言反馈回生成器，信息量远大于只给一个标量分数。
 
+回传的每条尝试带着**具体改了什么**（`edits`）、**分数怎么变的**
+（`score_before` → `score_after`）以及**哪几项受保护指标回退了**
+（`regressed_metrics`）。只给 decision + reason 说明不了上次试的是哪个
+改法，生成器完全可以再提一遍等价修改，门禁再拒一次，重试额度就这么烧完。
+这个条目形状取自 [SkillOpt](https://github.com/microsoft/SkillOpt) 的
+step buffer（`trainer.py` 的 `_format_step_buffer`）——它回传的正是
+`### Step 12 — REJECT (7/40 failed)` 加 `Rejected edits (score 0.62 →
+0.55)`。**没跑到评测的尝试不填 0.0**，那几个键直接不出现：一条没测过的
+尝试与一条测出 0.0 的尝试意义完全相反，填 0 会让生成器绕开一个其实
+没被检验过的方向。
+
+反思信号有两道预算，它们的过期语义**刻意不同**：
+
+- **随基线过期。** 一条针对 v1 提示词被拒的记录，在提示词走到 v6 之后
+  不再是证据——那句“别这么改”是相对一个已经不存在的基线得出的，当前
+  基线里可能压根没有那段文本。所以账本行记下**门禁基线版本**
+  （active 版本，不是 `parent_version`：亲本只决定候选从哪改起，不影响
+  结论还成不成立），`list_reflection_attempts` 只取同一基线上的行。
+  本列加入之前的老行归属不到任何基线，同样不回传——猜一个基线号会把
+  陈旧结论伪装成新鲜的。SkillOpt 的 `step_buffer` 是同一个做法：它建在
+  epoch 循环**内部**，epoch 一结束就丢。
+- **不随基线过期：重试上限。** `count_attempts_by_fingerprint` 照旧数
+  全部历史行。这个数回答的是“在这个根因上一共花过多少次全量回放”，那
+  笔钱不会因为提示词换了版本就退回来。让它跟着基线过期的话，每激活一个
+  新版本就等于给所有根因重置额度，`max_attempts_per_root_cause` 名存
+  实亡——又一道假装在工作的门禁。`tests/test_memory_in_evolution.py::
+  test_expiry_does_not_refund_the_retry_budget` 钉住这条区分。
+
+`list_evolution_attempts`（审计视图）不做任何过滤，全部历史都在那里：
+过期只作用于“喂回生成器的信号”，不作用于“能不能看见”。
+
+条数上限见 `EVOAGENT_EVOLUTION_MAX_REFLECTION_ATTEMPTS`。排序在截断
+之前：先按“这个根因一共试过几次”降序——试得最多的那个最接近重试上限，
+最该被劝阻——再按账本行倒序。截断掉的条数进 `reflection.dropped_over_budget`，
+静默切会让“这轮只有 2 条历史”和“这轮有 40 条但只送了 2 条”长得一样。
+
 注意这**不违反**“记忆不进评测链路”的隔离原则（见 `memory.py` 模块
 文档）。那条原则针对被评测 case 的执行过程：跨 case 召回会让第二次的
 “发现”变成召回而不是检出，指标朝着我们希望的方向虚高，且 Validation
@@ -453,6 +489,13 @@ Skill 自进化与提示词进化是两套独立版本链。系统不会把反�
 - `EVOAGENT_EVOLUTION_MAX_ATTEMPTS_PER_ROOT_CAUSE`：同一根因最多尝试
   几次，默认 `3`，`0` 表示不限制。反复尝试反复失败说明“改提示词”对
   这类根因无效；
+- `EVOAGENT_EVOLUTION_MAX_REFLECTION_ATTEMPTS`：单轮最多回传几条历史
+  尝试当反思信号，默认 `12`，`0` 表示不截断。这道上限封的是候选生成那次
+  调用的**输入**——`EVOAGENT_EVOLUTION_GENERATOR_TOKEN_BUDGET` 封的是
+  `max_tokens`，也就是输出，封不住输入。所以不设上限的后果不是报错，是
+  账本随轮次单调增长、把真正要看的 `failure_cases` 和 `active_prompt`
+  挤出输入，而且看不出来。截断掉的条数会出现在返回值的
+  `reflection.dropped_over_budget` 里；
 - `EVOAGENT_EVOLUTION_PARENT_STRATEGY`：选亲策略，`active`（默认）/
   `best` / `pareto` / `epsilon_greedy`。拼错会在启动时报错而不是静默
   跑成 `active`；
