@@ -145,16 +145,22 @@ class Settings:
     evolution_parent_epsilon: float = 0.1
     # 候选生成那一次 LLM 调用的 max_tokens。
     #
-    # 默认从 6000 抬到 16000：**在推理模型上 6000 根本跑不完一次候选生成**。
-    # `max_tokens` 同时封顶 reasoning + content，deepseek-v4-flash 实测把
-    # 6000 全部花在推理上（`finish_reason=length`、`reasoning_tokens=6000`、
-    # `content=''`），一条候选都产不出来。第 16.5 节修的是这个错误的**报错
-    # 文案**（原来报成"模型返回了非法 JSON"），预算本身没动，于是回路 A 至今
-    # 一次都没真跑起来过。
+    # 默认从 6000 抬到 16000 再到 32000。两次抬高是同一个原因的两种表现：
+    # **`max_tokens` 同时封顶 reasoning + content**，而推理占大头。
     #
-    # 抬高的代价是单轮成本上升，但产不出候选的调用是纯浪费——它同样按
-    # 6000 token 计费，只是什么都没换回来。
-    evolution_generator_token_budget: int = 16000
+    # 6000：全部花在推理上（`finish_reason=length`、`reasoning_tokens=6000`、
+    # `content=''`），一条候选都产不出来。
+    #
+    # 16000：实测 25 条反馈下 `completion_tokens=13299`（其中推理 11740，
+    # 内容只有 1559），只剩 17% 余量。推理多花几百个 token 就会把 content
+    # 截在半截——表现为**间歇性失败**，同样的输入重放一次往往就过了。回路 C
+    # 第一轮就是这么死的。而反馈条数还会继续涨（误报侧才 5 条），顶着上限
+    # 跑等于让闭环随机失败。
+    #
+    # 抬高的代价是单轮成本上升，但**产不出候选的调用照常计费**——那次失败
+    # 的调用付了 13299 token 的钱，什么都没换回来。截断的那种更糟：它可能
+    # 恰好解析成功，于是一份缺了后半截的候选被当成完整的送进门禁。
+    evolution_generator_token_budget: int = 32000
     # 每个切分单轮回放的样本上限。
     #
     # 默认从 5 抬到 20：**5 条下受保护指标的分母只有个位数,门禁量到的
@@ -380,7 +386,7 @@ class Settings:
             evolution_parent_epsilon=float(
                 os.getenv("EVOAGENT_EVOLUTION_PARENT_EPSILON", "0.1")),
             evolution_generator_token_budget=_int(
-                "EVOAGENT_EVOLUTION_GENERATOR_TOKEN_BUDGET", 16000),
+                "EVOAGENT_EVOLUTION_GENERATOR_TOKEN_BUDGET", 32000),
             eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 20),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),

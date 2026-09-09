@@ -55,22 +55,34 @@ class JsonChatClient:
                 body = json.loads(response.read().decode("utf-8"))
             choice = body["choices"][0]
             content = choice["message"]["content"]
-            # 推理模型上 max_tokens 同时封顶 reasoning + content：预算被推理
-            # 吃完时 content 是空串，finish_reason 是 length。直接 json.loads("")
-            # 会报 "Expecting value: line 1 column 1"，把一个预算问题说成模型
-            # 返回了非法 JSON——照着那条消息去查 JSON 解析永远查不到病根。
-            if not (content or "").strip():
+            # 判据是 finish_reason，不是 content 空不空。
+            #
+            # 推理模型上 max_tokens 同时封顶 reasoning + content，预算耗尽有
+            # **两种**表现：推理吃光全部预算 → content 空串；推理吃掉大部分、
+            # content 只写了一半 → 截断的 JSON。原来只拦第一种，第二种掉进
+            # json.loads，报成 "Unterminated string starting at char 5103"，
+            # 于是同一个病根产出两条完全不同的消息，其中一条把人指向 JSON
+            # 解析——照着它查永远查不到预算上。
+            #
+            # 而且第二种更隐蔽：它取决于推理多花了几百个 token，表现为**间歇
+            # 性失败**，同样的输入重放一次往往就过了。
+            #
+            # 截断的 JSON 恰好能解析出来时也要拦（所以这道检查在 json.loads
+            # 之前）。那比报错更危险：一份缺了后半截的候选会被当成完整的候选
+            # 送进门禁——与本仓库反复出现的那类"假装成功"是同一种错误。
+            if choice.get("finish_reason") == "length" or not (content or "").strip():
                 usage = body.get("usage") or {}
                 details = usage.get("completion_tokens_details") or {}
                 raise ValueError(
-                    "model returned empty content (finish_reason=%s, "
-                    "completion_tokens=%s, reasoning_tokens=%s, max_tokens=%s); "
-                    "raise the token budget for reasoning models"
+                    "model output hit the token budget (finish_reason=%s, "
+                    "completion_tokens=%s, reasoning_tokens=%s, max_tokens=%s, "
+                    "content_chars=%d); raise the token budget for reasoning models"
                     % (
                         choice.get("finish_reason"),
                         usage.get("completion_tokens"),
                         details.get("reasoning_tokens"),
                         max_tokens,
+                        len(content or ""),
                     )
                 )
             result = json.loads(content)

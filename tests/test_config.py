@@ -61,6 +61,19 @@ class GeneratorTokenBudgetTests(unittest.TestCase):
                 Settings.from_env().evolution_generator_token_budget, 6000
             )
 
+    def test_the_default_leaves_headroom_above_a_measured_generation(self):
+        """光大于 6000 不够：16000 也曾是默认值，且实测会间歇性截断。
+
+        25 条反馈下实测 `completion_tokens=13299`（推理 11740 + 内容 1559）。
+        默认值必须显著高于这个数，否则推理多花几百个 token 就把 content 截在
+        半截——表现为随机失败，而失败的那次调用照常计费。反馈条数还会涨，
+        余量只会更紧。
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertGreaterEqual(
+                Settings.from_env().evolution_generator_token_budget, 24000
+            )
+
     def test_it_is_configurable_from_the_environment(self):
         with patch.dict(
             os.environ,
