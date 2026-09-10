@@ -215,7 +215,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: high
     target_prs: 7
-    clean_target_prs: 7
+    clean_target_prs: 15
 
   - name: apache/airflow
     split: holdout
@@ -227,7 +227,7 @@ repos:
     difficulty_tendency: [L3, L4]
     test_cost: high
     target_prs: 7
-    clean_target_prs: 7
+    clean_target_prs: 15
 
   - name: psf/requests
     split: holdout
@@ -240,7 +240,7 @@ repos:
     difficulty_tendency: [L1, L2]
     test_cost: low
     target_prs: 5
-    clean_target_prs: 5
+    clean_target_prs: 13
 
   - name: PyCQA/bandit
     split: holdout
@@ -253,7 +253,7 @@ repos:
     difficulty_tendency: [L1, L2]
     test_cost: low
     target_prs: 5
-    clean_target_prs: 5
+    clean_target_prs: 13
 
   - name: pallets/jinja
     split: holdout
@@ -265,7 +265,7 @@ repos:
     difficulty_tendency: [L2, L3]
     test_cost: low
     target_prs: 5
-    clean_target_prs: 5
+    clean_target_prs: 13
 
 # ══════════════════════════════════════════════════════════════════════
 # 采集后复核（2026-09，95 条产出。上面的 expect_classes /
