@@ -218,6 +218,7 @@ class BoundedRole:
     def __init__(
         self, name: str, prompt: str, client: JsonChatClient,
         token_budget: int, time_budget: int, max_steps: int = 4,
+        max_call_tokens: int = 16000,
     ):
         self.name = name
         self.prompt = prompt
@@ -225,6 +226,13 @@ class BoundedRole:
         self.token_budget = token_budget
         self.time_budget = time_budget
         self.max_steps = max_steps
+        # 推理模型的 max_tokens 同时封顶 reasoning + content（见
+        # docs/next-development-plan.md §20.1，generator 那条预算已经从 6000
+        # 抬到 16000 才跑通）。这里原来硬编码 min(4000, ...)，与角色自己的
+        # token_budget 无关——即使调用方把 token_budget 开到几万，单次调用
+        # 仍然会被 4000 掐死，在 deepseek-v4-flash 上表现为 finish_reason=
+        # length 或截断 JSON。改成可配置上限，默认对齐 generator 那次修复。
+        self.max_call_tokens = max_call_tokens
 
     def run(
         self, user_context: str, tools: ToolRegistry, ledger: ExecutionLedger,
@@ -264,9 +272,28 @@ class BoundedRole:
             action = self.client.complete_json(
                 self.name, self.prompt,
                 json.dumps(managed, ensure_ascii=False, default=str),
-                ledger, max_tokens=min(4000, max(256, self.token_budget - used)),
+                ledger, max_tokens=min(self.max_call_tokens, max(256, self.token_budget - used)),
             )
             kind = str(action.get("action", "")).strip().lower()
+            # 同义词归一。实测 deepseek-v4-flash 会用 complete / finish /
+            # done / answer 代替 final，也会在 action 里写 use_tool。这些不是
+            # 坏输出，是模型没照抄字面量——把整条 case 判成执行失败（记成漏报）
+            # 是拿模型的用词习惯去惩罚它的审查能力，度量的东西就错了。
+            #
+            # 只归一**动作标签**，不碰载荷：findings 该长什么样仍然由
+            # _parse_findings 严格校验，所以这里放宽不会让编造的结论蒙混过关。
+            if kind in ("complete", "completed", "finish", "finished", "done",
+                        "answer", "final_answer", "submit", "report"):
+                kind = "final"
+            elif kind in ("use_tool", "tool_call", "call_tool", "invoke_tool"):
+                kind = "tool"
+            elif not kind:
+                # action 字段整个缺失时，按载荷推断：带 findings / task_graph
+                # 就是终态，带 tool 就是工具调用。推断不出来才算真的违反协议。
+                if "findings" in action or "task_graph" in action:
+                    kind = "final"
+                elif action.get("tool"):
+                    kind = "tool"
             ledger.trace(
                 self.name, "autonomous_decision", step=step, action=kind,
                 tool=str(action.get("tool", "")), reason=str(action.get("reason", ""))[:500],
@@ -277,7 +304,14 @@ class BoundedRole:
                 ledger.trace(self.name, "finished", step=step)
                 return action
             if kind != "tool":
-                raise ValueError("%s returned an invalid action" % self.name)
+                # 报出实际收到的动作和载荷字段，否则日志里只有"invalid action"，
+                # 查的时候完全不知道模型到底说了什么。
+                raise ValueError(
+                    "%s returned an invalid action: action=%r keys=%s" % (
+                        self.name, str(action.get("action", ""))[:60],
+                        sorted(k for k in action if not k.startswith("_"))[:8],
+                    )
+                )
             tool_name = str(action.get("tool", ""))
             arguments = action.get("arguments") or {}
             try:
@@ -349,11 +383,26 @@ class ModeRouterReviewer(Reviewer):
         prompt_overlay: str = "",
         structured_config: Optional[Dict[str, Any]] = None,
         critic_position_check: bool = False,
+        max_call_tokens: int = 16000,
+        agent_loop_max_steps: int = 4,
     ):
         self.store = store
         self.client = llm_client
         self.default_token_budget = default_token_budget
         self.default_time_budget = default_time_budget
+        # 这两个上限原来只存在于 BoundedRole 的默认参数里，四个构造点全部
+        # 不传，于是无法从评测入口调整。实测代价：164 条 × 4 臂的跑批里
+        # 55 条死于 max_call_tokens（finish_reason=length，
+        # completion_tokens=reasoning_tokens=16000，content 一个字没写）、
+        # 36 条死于 max_steps=4 用完还没 final。full-agentic 的
+        # execution_success_rate 因此只有 30.5%。
+        #
+        # 尤其要说清 max_call_tokens 和 token_budget 的关系：后者是一个
+        # 角色跨步数的累计预算，前者是**单次调用**的上限，两者在
+        # BoundedRole.run 里取 min。所以把总预算从 24000 抬到 80000 对
+        # "单次推理烧光预算"这个病根完全无效——那 55 条失败就是这么来的。
+        self.max_call_tokens = int(max_call_tokens)
+        self.agent_loop_max_steps = int(agent_loop_max_steps)
         self.input_cost_per_million = input_cost_per_million
         self.output_cost_per_million = output_cost_per_million
         self.enabled_roles = enabled_roles or {
@@ -502,6 +551,8 @@ class ModeRouterReviewer(Reviewer):
                 if self.prompt_overlay else ""
             ),
             self.client, self._token_budget("hybrid-reviewer"), self.default_time_budget,
+            max_steps=self.agent_loop_max_steps,
+            max_call_tokens=self.max_call_tokens,
         )
         result = role.run(
             json.dumps({
@@ -533,6 +584,8 @@ class ModeRouterReviewer(Reviewer):
                     if self.prompt_overlay else ""
                 ), self.client,
                 self._token_budget("planner"), self.default_time_budget,
+                max_steps=self.agent_loop_max_steps,
+                max_call_tokens=self.max_call_tokens,
             )
             plan = planner.run(
                 json.dumps({
@@ -567,6 +620,8 @@ class ModeRouterReviewer(Reviewer):
                     role = BoundedRole(
                         name, prompt, self.client,
                         self._token_budget(name), self.default_time_budget,
+                        max_steps=self.agent_loop_max_steps,
+                        max_call_tokens=self.max_call_tokens,
                     )
                     scope = scopes.get(name)
                     context = json.dumps({
@@ -603,6 +658,8 @@ class ModeRouterReviewer(Reviewer):
                     if self.prompt_overlay else ""
                 ), self.client,
                 self._token_budget("critic"), self.default_time_budget,
+                max_steps=self.agent_loop_max_steps,
+                max_call_tokens=self.max_call_tokens,
             )
             # gate 的证据缺口。和 activity 一样只读已发生的执行 / 纯计算，
             # 不产生新的模型调用，所以这个回路不加成本。
