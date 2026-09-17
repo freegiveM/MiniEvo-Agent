@@ -112,17 +112,25 @@ class TokenBudgetGuardTests(unittest.TestCase):
         self.assertIn("token budget", str(caught.exception))
 
     def test_an_empty_content_without_length_is_also_refused(self):
-        """content 空串但 finish_reason 不是 length：仍然产不出候选。
+        """content 空串但 finish_reason=stop：仍然产不出候选，但**不是**预算耗尽。
 
-        判据改成 finish_reason 之后，这一支靠的是那个 `or`。少了它，一次
-        返回空串的调用会掉进 json.loads("")，回到原来那条误导性消息。
+        这里刻意断言消息里**没有** "token budget"。原来两种病根合并成同一条
+        "hit the token budget"，实测代价很实在：真实故障是
+        finish_reason=stop、completion_tokens 远低于上限、答案全留在
+        reasoning_content 里、content 通道只吐了几个空格，而那条消息把人指向
+        "抬预算"——抬到 16000 也没用，因为根本没到顶。
+
+        所以判据是 finish_reason 而不是 content 空不空，两支各报各的原因。
         """
         self._respond(_body("   ", "stop"))
 
         with self.assertRaises(RuntimeError) as caught:
             self._call()
 
-        self.assertIn("token budget", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("blank content", message)
+        self.assertIn("reasoning_content", message)
+        self.assertNotIn("token budget", message)
 
     def test_a_complete_response_is_returned_unchanged(self):
         """收紧不能误伤正常返回：finish_reason=stop + 完整 JSON 照常通过。"""
