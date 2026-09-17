@@ -290,6 +290,24 @@ DEFECT_CLASSES: Tuple[DefectClass, ...] = (
             re.compile(r"(?i)\b(and|or|not)\b"),
         ),
     ),
+    # 下面四类是 LLM 重打标（scripts/relabel_pr_defect_dataset.py）引入的词汇，
+    # **刻意不给 patterns**，因此对正则分类器的行为零影响：
+    #
+    #   - 位置在 logic-boundary 之后，而 logic-boundary 的 patterns 宽到几乎
+    #     任何 diff 都会命中（一个比较运算符就够），所以 code-pattern 那轮走不
+    #     到这里；patterns 为空也不会命中。
+    #   - title-word 那轮（item.name.split("-")[0] in lowered）同理走不到，
+    #     因为 code-pattern 轮几乎总是先返回。
+    #
+    # 为什么还要加：`tests/test_match_tiers.py` 锁定
+    # `{DEFECT_CLASSES 的名字} == set(CWE_FAMILY.values())`——评测的族名必须和
+    # 数据集的类名对齐，否则"分档报数"和"分类报数"对不上。评测侧已经扩到十二
+    # 族（真实数据里 53/73 条落不进原来的八类），这里补齐词汇表，让那个约束
+    # 继续成立。不是给采集器加能力，是让两边的词汇表一致。
+    DefectClass("input-validation", "CWE-1284", "medium", False, ()),
+    DefectClass("type-contract", "CWE-704", "medium", False, ()),
+    DefectClass("encoding", "CWE-116", "medium", False, ()),
+    DefectClass("protocol-state", "CWE-372", "medium", False, ()),
 )
 
 _CLASS_BY_NAME = {item.name: item for item in DEFECT_CLASSES}

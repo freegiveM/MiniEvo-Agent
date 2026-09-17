@@ -200,8 +200,24 @@ class ClassificationTests(unittest.TestCase):
             ).DEFECT_CLASSES if not item.rule_covered
         }
         self.assertEqual(
-            {"auth-bypass", "resource-leak", "logic-boundary", "concurrency"},
+            {
+                "auth-bypass", "resource-leak", "logic-boundary", "concurrency",
+                # LLM 重打标引入的四类同样没有确定性规则覆盖，所以臂 A 在它们
+                # 上的召回上限也是 0。这不是放宽断言：新增四类的 rule_covered
+                # 全是 False，集合按定义就该变大。真正要钉住的是"前四类不许悄悄
+                # 变成 True"（那意味着有人声称规则集能抓这些缺陷），下面单独断言。
+                "input-validation", "type-contract", "encoding", "protocol-state",
+            },
             uncovered,
+        )
+        covered = {
+            item.name for item in __import__(
+                "evoagent.dataset_builder", fromlist=["DEFECT_CLASSES"]
+            ).DEFECT_CLASSES if item.rule_covered
+        }
+        self.assertEqual(
+            {"crypto-weak", "injection", "secret-exposure", "path-traversal"},
+            covered,
         )
 
     def test_the_rule_set_cannot_reach_an_ordinary_real_world_fix(self):
