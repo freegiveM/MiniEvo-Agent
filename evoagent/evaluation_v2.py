@@ -214,6 +214,8 @@ class ProductArmReviewer:
         self, arm: str, client: JsonChatClient, total_token_budget: int,
         total_time_budget_seconds: int = 120,
         critic_position_check: bool = False,
+        max_call_tokens: int = 16000,
+        agent_loop_max_steps: int = 4,
     ):
         if arm not in ARM_TOPOLOGY:
             raise ValueError("unknown evaluation arm: %s" % arm)
@@ -253,7 +255,14 @@ class ProductArmReviewer:
             enabled_roles=enabled,
             scanners=[ContextRuleReviewer()],
             critic_position_check=bool(critic_position_check),
+            # 这两个上限对所有臂一视同仁，否则公平性就破了：多角色臂如果比
+            # 单角色臂更容易死于预算，它反而会"看起来"更省 token（失败的
+            # 样本不计费），把执行失败伪装成效率优势。
+            max_call_tokens=int(max_call_tokens),
+            agent_loop_max_steps=int(agent_loop_max_steps),
         )
+        self.max_call_tokens = int(max_call_tokens)
+        self.agent_loop_max_steps = int(agent_loop_max_steps)
         self._sequence = 0
         self._last_summary: Dict[str, Any] = {}
 
@@ -310,12 +319,20 @@ class ProductArmReviewer:
             "per_role_token_budget": self.per_role_token_budget,
             "total_time_budget_seconds_per_pr": self.total_time_budget_seconds,
             "per_role_time_budget_seconds": self.per_role_time_budget_seconds,
+            # 单次调用上限和步数上限也属于"各臂配置相同"的一部分,必须进
+            # fairness 块。上一批数据的教训:这两个值只存在于代码默认参数里,
+            # 报告里查不到,于是无法判断某个臂的低 token 均值是真省还是
+            # 大量样本死在预算上没计费。
+            "max_call_tokens": self.max_call_tokens,
+            "agent_loop_max_steps": self.agent_loop_max_steps,
         }
 
 
 def product_reviewer_factories(
     client: JsonChatClient, total_time_budget_seconds: int = 120,
     critic_position_check: bool = False,
+    max_call_tokens: int = 16000,
+    agent_loop_max_steps: int = 4,
 ) -> Dict[str, Callable[[str, int], ProductArmReviewer]]:
     """Create all four arms with one model client and a shared total budget.
 
@@ -333,6 +350,8 @@ def product_reviewer_factories(
         return ProductArmReviewer(
             arm, client, token_budget, total_time_budget_seconds,
             critic_position_check=critic_position_check,
+            max_call_tokens=max_call_tokens,
+            agent_loop_max_steps=agent_loop_max_steps,
         )
 
     return {

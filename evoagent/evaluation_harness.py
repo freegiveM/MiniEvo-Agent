@@ -105,15 +105,162 @@ CWE_FAMILY = {
     # concurrency
     "CWE-362": "concurrency", "CWE-366": "concurrency",
     "CWE-367": "concurrency", "CWE-543": "concurrency",
-    # 刻意未映射：CWE-601（开放重定向）等落在八类之外的编号。
+    # ── 以下四族是后加的（2026-09），补真实 bugfix 的主体 ──────────────
+    #
+    # 为什么必须扩：上面八族对齐的是 dataset_builder 的八类，那套分类覆盖
+    # 不住真实历史 bugfix。实测证据——用 LLM 重打标 95 条真实 PR，73 条真
+    # 缺陷里有 53 条落在八类之外（只能标 CWE-noinfo）；而 category 档在
+    # truth 无族时退回严格字符串相等（见 _candidate_edges 的注释），于是
+    # 一个**定位完全正确**的 reviewer 在 category 档只能拿 12%。那不是在
+    # 测 reviewer，是在测标注体系的窟窿。
+    #
+    # 为什么只加、不改：上面任何一条既有映射被挪走，都会回溯改变历史评测
+    # 数字（本文件开头的告警）。所以这四族用的全是**此前未映射**的编号，
+    # 既有样本的 category 判定逐条不变。特别是 CWE-20 仍留在
+    # logic-boundary——把它挪到 input-validation 更"正确"，但那会让所有
+    # 历史 logic-boundary 的数字失真，不值得。
+    #
+    # 抽样依据（重打标的 rationale，可对着 fix_pr_url 复核）：
+    #   aiohttp-13581  Range 头解析大小写敏感，拒了合法的 Bytes=0-5  → encoding
+    #   aiohttp-13536  接受了 RFC 6455 保留码 1006                   → protocol-state
+    #   aiohttp-12724  'upgrade' in header 子串匹配，notupgrade 也过 → input-validation
+    "CWE-1284": "input-validation", "CWE-129": "input-validation",
+    "CWE-1287": "input-validation", "CWE-233": "input-validation",
+    "CWE-704": "type-contract", "CWE-843": "type-contract",
+    "CWE-681": "type-contract", "CWE-197": "type-contract",
+    "CWE-116": "encoding", "CWE-838": "encoding",
+    "CWE-172": "encoding", "CWE-176": "encoding",
+    "CWE-372": "protocol-state", "CWE-696": "protocol-state",
+    "CWE-666": "protocol-state", "CWE-826": "protocol-state",
+    # 刻意未映射：CWE-601（开放重定向）等落在上述族之外的编号。
     # 未映射 → 永不 category 命中，这是正确行为：reviewer 报了一个不在
     # 本数据集标注体系里的类别，不该算作"认出了这类问题"。
+    #
+    # CWE-noinfo 也刻意不映射。它是"判不出类别"的记号，不是一个类别；
+    # 给它一个族等于让"我不知道"也能算 category 命中。
 }
 
 
 def cwe_family(cwe: str) -> str:
-    """Map a CWE id to one of the eight defect families, or '' when unknown."""
+    """Map a CWE id to one of the defect families, or '' when unknown."""
     return CWE_FAMILY.get(str(cwe).strip().upper(), "")
+
+
+# rule_id 里内嵌的 CWE 编号，例如 "CWE-617-reachable-assertion"、
+# "cwe-532-sensitive-information-in-log"。
+_EMBEDDED_CWE = re.compile(r"CWE[-_]?(\d{1,4})", re.IGNORECASE)
+
+
+def finding_family_of(finding) -> str:
+    """`finding_family` 的便利包装，直接吃一个 Finding。"""
+    return finding_family(getattr(finding, "rule_id", ""))
+
+
+def finding_family(rule_id: str) -> str:
+    """把 reviewer 的 rule_id 归到缺陷族，归不出来返回 ''。
+
+    ## 为什么需要这个函数
+
+    `RULE_TO_CWE` 只认本地规则引擎那 22 个固定 rule_id。LLM reviewer 输出的是
+    自由文本 rule_id——实测 110 个 finding 里有 95 个互不相同的取值
+    （`http-range-unit-case-sensitivity`、`weak-cipher-enabled`、
+    `security.port-zero-truthiness.proxy-port`……），只有 `REL-DEBUG-PRINT`
+    在表里。其余全部走 `RULE_TO_CWE.get(rule_id, rule_id)` 的兜底，被当成 CWE
+    编号本身,于是 `cwe_family()` 一律返回 ''，category 档恒为 0。
+
+    实测后果：single-llm 在 location 档拿到 42.9%，category 档 0.0%。这违反了
+    本文件开头声明的单调性（cwe-exact ≤ category ≤ location 恒成立），所以它是
+    bug 而不是"模型归因能力差"。
+
+    ## 为什么用关键词而不是让 LLM 自报 CWE
+
+    `Finding` 没有 cwe 字段，让 reviewer 多报一个 CWE 号要改产品侧的输出契约，
+    而且会把"选哪个兄弟节点"的噪声引进来——本文件开头那段注释正是为此才设计
+    了三档。这里只做一件事：从 rule_id 的文本里认出缺陷族。判不出来就返回 ''，
+    宁可少算命中，不放宽。
+
+    ## 与 cwe-exact 档的关系
+
+    不参与 cwe-exact。那一档按开头的注释"只在 CVE/GHSA 子集上有意义"，从
+    rule_id 猜出来的 CWE 号没有权威性，拿去做严格比较只会制造假命中。
+    """
+    text = str(rule_id or "").strip()
+    if not text:
+        return ""
+    mapped = RULE_TO_CWE.get(text)
+    if mapped:
+        return cwe_family(mapped)
+    embedded = _EMBEDDED_CWE.search(text)
+    if embedded:
+        family = cwe_family("CWE-" + embedded.group(1))
+        if family:
+            return family
+    lowered = text.lower()
+    for family, keywords in _FAMILY_KEYWORDS:
+        if any(word in lowered for word in keywords):
+            return family
+    return ""
+
+
+# 顺序即优先级：一个 rule_id 命中多族时取先匹配的。把最具体、最不容易误伤的
+# 族排在前面，logic-boundary 这类宽泛特征放最后。
+#
+# 关键词只从 rule_id 里认词，不看 title/explanation——那两个字段是自由散文，
+# 用它们匹配等于让"提到了 injection 这个词"也算归因正确。
+_FAMILY_KEYWORDS = (
+    ("secret-exposure", (
+        "sensitive-data", "sensitive-information", "sensitive_data", "secret",
+        "credential", "password-log", "data-exposure", "information-disclosure",
+        "leak-credential",
+    )),
+    ("crypto-weak", (
+        "weak-cipher", "weak-crypto", "weak-hash", "blowfish", "md5", "sha1",
+        "cipher", "tls-version", "ssl-context", "certificate", "bcrypt",
+        "weak-doh", "crypto",
+    )),
+    ("injection", (
+        "injection", "sql-concat", "command-exec", "eval", "deserial",
+        "pickle", "yaml-load", "log-forging", "xss", "autoescape",
+    )),
+    ("path-traversal", ("path-traversal", "directory-traversal", "zip-slip")),
+    ("auth-bypass", (
+        "auth-bypass", "authz", "authorization", "authentication",
+        "permission", "reachable-assertion", "assert-auth", "proxy-auth",
+        "bypass",
+    )),
+    ("concurrency", (
+        "race", "deadlock", "concurren", "atomic", "thread-safe", "lock",
+        "gil", "shutdown-order",
+    )),
+    ("resource-leak", (
+        "leak", "unclosed", "unbounded", "retry", "exhaust", "timeout-hang",
+        "hang", "blocking-sync", "blocking-call", "performance-regression",
+    )),
+    ("protocol-state", (
+        "websocket", "http-", "header", "close-code", "state-machine",
+        "handshake", "protocol", "redirect", "ipv6-authority", "netloc",
+        "duplicate-host", "range-unit", "no_proxy", "no-proxy",
+    )),
+    ("encoding", (
+        "encoding", "decoding", "percent-encod", "percent-decod", "escape",
+        "charset", "case-sensitivity", "case-bypass", "normali", "serializ",
+        "string-concatenation",
+    )),
+    ("input-validation", (
+        "validation", "validate", "schema", "sanitiz", "truthiness",
+        "zero-hang", "alias-mismatch", "containment", "empty-except",
+        "narrowed-exception", "unhandled-exception",
+    )),
+    ("type-contract", (
+        "type-", "sentinel", "none-handling", "none-secret", "nonetype",
+        "attribute-", "signature", "return-contract", "float-money",
+        "naive-datetime",
+    )),
+    ("logic-boundary", (
+        "off-by-one", "boundary", "logic-regression", "logic-", "inverted",
+        "comparison", "operator", "interval", "absolute-time",
+    )),
+)
 
 
 @dataclass
@@ -218,7 +365,10 @@ def _candidate_edges(
             if tier == MATCH_CWE_EXACT and finding_cwe != truth_cwe:
                 continue
             if tier == MATCH_CATEGORY:
-                finding_family = cwe_family(finding_cwe)
+                # 先按 rule_id 归族（认得 LLM 的自由文本 rule_id），归不出来
+                # 再退回 CWE 编号那条老路——本地规则引擎的 rule_id 两条路都能走，
+                # 结果一致。
+                finding_family = finding_family_of(finding) or cwe_family(finding_cwe)
                 # 双方都要能映射到族且同族。truth 映射不出族时（数据集用了
                 # 八类之外的 CWE）退回严格相等，而不是放任全部命中——
                 # 无族信息时"同族"这个概念没有定义，宁可保守。

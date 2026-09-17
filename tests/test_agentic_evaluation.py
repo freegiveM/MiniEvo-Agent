@@ -116,5 +116,62 @@ class AgenticEvaluationTests(unittest.TestCase):
         )
 
 
+class ActionNormalisationTests(unittest.TestCase):
+    """动作标签的同义词归一。
+
+    实测背景：164 条 × 4 臂的跑批里 36 条死于 "returned an invalid action"。
+    模型并没有产出坏 JSON，只是没照抄 "final" 这个字面量——会写 complete、
+    finish，或者干脆省掉 action 字段直接给 findings。把这些判成执行失败会记
+    成漏报，等于拿模型的用词习惯去惩罚它的审查能力。
+    """
+
+    def _role(self, responses):
+        from evoagent.agentic_core import BoundedRole
+        from evoagent.runtime import ToolRegistry
+        from evoagent.telemetry import ExecutionLedger
+
+        queue = list(responses)
+
+        class Client:
+            provider = "fake"
+            model = "fake-model"
+
+            def complete_json(self, role, _system, _user, ledger=None,
+                              max_tokens=None):
+                return queue.pop(0)
+
+        role = BoundedRole("security", "p", Client(), 10000, 60)
+        return role, ToolRegistry(()), ExecutionLedger("test")
+
+    def test_final_synonyms_are_accepted(self):
+        for word in ("complete", "finish", "done", "answer", "submit",
+                     "FINAL", " Completed "):
+            role, tools, ledger = self._role(
+                [{"action": word, "findings": []}]
+            )
+            result = role.run("task", tools, ledger)
+            self.assertEqual([], result["findings"], word)
+
+    def test_a_missing_action_is_inferred_from_the_payload(self):
+        role, tools, ledger = self._role([{"findings": []}])
+        self.assertEqual([], role.run("task", tools, ledger)["findings"])
+
+        role, tools, ledger = self._role([{"task_graph": []}])
+        self.assertEqual([], role.run("task", tools, ledger)["task_graph"])
+
+    def test_a_genuinely_unrecognisable_action_still_fails_loudly(self):
+        """放宽不等于什么都收：既没有已知标签、也没有终态载荷，仍须报错。
+
+        而且错误消息必须带上实际收到的 action 和字段名——原来只有一句
+        "invalid action"，排查时完全不知道模型说了什么。
+        """
+        role, tools, ledger = self._role([{"action": "ponder", "thoughts": "hm"}])
+        with self.assertRaises(ValueError) as caught:
+            role.run("task", tools, ledger)
+        message = str(caught.exception)
+        self.assertIn("ponder", message)
+        self.assertIn("thoughts", message)
+
+
 if __name__ == "__main__":
     unittest.main()
